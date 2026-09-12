@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "timestamp",
+    "trade_id",
+    "symbol",
+    "mode",
+    "action_attempted",
+    "execution_guard_result",
+    "risk_result",
+    "broker_reconciliation_result",
+    "review_result",
+    "submission_result",
+    "robinhood_order_id",
+    "state_transition",
+    "warnings",
+    "errors"
+  ],
+  "properties": {
+    "timestamp": {"type": "string", "format": "date-time"},
+    "trade_id": {"type": "string", "minLength": 1},
+    "symbol": {"type": "string", "pattern": "^[A-Z][A-Z0-9.-]{0,9}$"},
+    "mode": {"enum": ["ANALYSIS_ONLY", "SHADOW_TRADING", "REVIEW_ONLY", "LIVE_AUTONOMOUS"]},
+    "action_attempted": {"type": "string"},
+    "execution_guard_result": {"type": ["object", "null"]},
+    "risk_result": {"type": "object"},
+    "broker_reconciliation_result": {"type": ["object", "null"]},
+    "review_result": {"type": ["object", "null"]},
+    "submission_result": {"type": ["object", "null"]},
+    "robinhood_order_id": {"type": ["string", "null"]},
+    "state_transition": {"type": "string"},
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "errors": {"type": "array", "items": {"type": "string"}}
+  }
+}

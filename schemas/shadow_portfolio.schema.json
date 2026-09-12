@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "starting_capital", "cash", "equity", "realized_pnl", "unrealized_pnl", "daily_pnl", "trading_date", "trades_today", "peak_equity", "maximum_drawdown", "maximum_drawdown_percent", "open_positions", "closed_positions", "benchmark_session", "updated_at"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "starting_capital": {"type": "number"},
+    "cash": {"type": "number"},
+    "equity": {"type": "number"},
+    "realized_pnl": {"type": "number"},
+    "unrealized_pnl": {"type": "number"},
+    "daily_pnl": {"type": "number"},
+    "trading_date": {"type": ["string", "null"]},
+    "trades_today": {"type": "integer", "minimum": 0},
+    "peak_equity": {"type": "number"},
+    "maximum_drawdown": {"type": "number", "minimum": 0},
+    "maximum_drawdown_percent": {"type": "number", "minimum": 0},
+    "open_positions": {"type": "array", "items": {"$ref": "#/$defs/position"}},
+    "closed_positions": {"type": "array", "items": {"$ref": "#/$defs/trade"}},
+    "benchmark_session": {"type": "object"},
+    "updated_at": {"type": ["string", "null"]}
+  },
+  "$defs": {
+    "position": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trade_id", "symbol", "direction", "strategy", "entry_price", "requested_entry_price", "entry_timestamp", "quantity", "notional_value", "stop", "target", "risk_per_share", "maximum_theoretical_loss", "risk_reward_ratio", "coordinator_confidence", "coordinator_score", "technical_score", "news_score", "sector_score", "market_score", "catalyst_type", "sector", "market_regime", "news_event_ids_at_entry", "last_price", "unrealized_pnl", "estimated_entry_slippage_cost", "warnings", "thesis", "invalidation_condition", "technical_context", "news_context", "sector_context", "market_context"],
+      "properties": {
+        "trade_id": {"type": "string"}, "symbol": {"type": "string"},
+        "direction": {"type": "string", "const": "LONG"}, "strategy": {"type": "string"},
+        "entry_price": {"type": "number"}, "requested_entry_price": {"type": "number"},
+        "entry_timestamp": {"type": "string"}, "quantity": {"type": "integer", "minimum": 1},
+        "notional_value": {"type": "number"}, "stop": {"type": "number"},
+        "target": {"type": "number"}, "risk_per_share": {"type": "number"},
+        "maximum_theoretical_loss": {"type": "number"}, "risk_reward_ratio": {"type": "number"},
+        "coordinator_confidence": {"type": "number"}, "coordinator_score": {"type": "number"},
+        "technical_score": {"type": "number"}, "news_score": {"type": "number"},
+        "sector_score": {"type": "number"}, "market_score": {"type": "number"},
+        "catalyst_type": {"type": "string"}, "sector": {"type": "string"},
+        "market_regime": {"type": "string"},
+        "news_event_ids_at_entry": {"type": "array", "items": {"type": "string"}},
+        "last_price": {"type": ["number", "null"]}, "unrealized_pnl": {"type": "number"},
+        "current_bid": {"type": ["number", "null"]},
+        "current_ask": {"type": ["number", "null"]},
+        "last_price_timestamp": {"type": ["string", "null"]},
+        "monitoring_status": {"type": "string"},
+        "quote_mode": {"type": "string"},
+        "quote_source": {"type": ["string", "null"]},
+        "mark_price_method": {"type": ["string", "null"]},
+        "estimated_entry_slippage_cost": {"type": "number"},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "thesis": {"type": ["string", "null"]},
+        "invalidation_condition": {"type": ["string", "null"]},
+        "technical_context": {"type": "object"},
+        "news_context": {"type": "object"},
+        "sector_context": {"type": "object"},
+        "market_context": {"type": "object"}
+        ,"slow_context_score": {"type": ["number", "null"]}
+        ,"live_market_score": {"type": ["number", "null"]}
+        ,"dynamic_score": {"type": ["number", "null"]}
+        ,"slow_weight": {"type": ["number", "null"]}
+        ,"live_weight": {"type": ["number", "null"]}
+        ,"context_age_seconds": {"type": ["number", "null"]}
+        ,"qualitative_score": {"type": ["number", "null"]}
+        ,"llm_score": {"type": ["number", "null"]}
+        ,"discovery_timestamp": {"type": ["string", "null"]}
+        ,"watchlist_timestamp": {"type": ["string", "null"]}
+        ,"trade_ready_timestamp": {"type": ["string", "null"]}
+        ,"state_transition_history": {"type": "array", "items": {"type": "object"}}
+      }
+    },
+    "trade": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trade_id", "symbol", "strategy", "sector", "entry_timestamp", "entry_price", "quantity", "stop", "target", "risk_reward_ratio", "exit_timestamp", "exit_price", "exit_reason", "gross_pnl", "estimated_slippage_cost", "net_pnl", "return_percent", "holding_time_minutes", "coordinator_confidence", "coordinator_score", "technical_score", "news_score", "sector_score", "market_score", "catalyst_type", "market_regime", "warnings"],
+      "properties": {
+        "trade_id": {"type": "string"}, "symbol": {"type": "string"},
+        "strategy": {"type": "string"}, "sector": {"type": "string"},
+        "entry_timestamp": {"type": "string"}, "entry_price": {"type": "number"},
+        "quantity": {"type": "integer", "minimum": 1}, "stop": {"type": "number"},
+        "target": {"type": "number"}, "risk_reward_ratio": {"type": "number"},
+        "exit_timestamp": {"type": "string"}, "exit_price": {"type": "number"},
+        "exit_reason": {"type": "string", "enum": ["STOP_HIT", "TARGET_HIT", "INVALIDATED", "END_OF_DAY_EXIT", "HARD_RISK_EXIT"]},
+        "exit_method": {"type": "string"},
+        "gross_pnl": {"type": "number"}, "estimated_slippage_cost": {"type": "number"},
+        "net_pnl": {"type": "number"}, "return_percent": {"type": "number"},
+        "holding_time_minutes": {"type": "number", "minimum": 0},
+        "coordinator_confidence": {"type": "number"},
+        "coordinator_score": {"type": "number"}, "technical_score": {"type": "number"},
+        "news_score": {"type": "number"}, "sector_score": {"type": "number"},
+        "market_score": {"type": "number"}, "catalyst_type": {"type": "string"},
+        "market_regime": {"type": "string"},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "slow_context_score": {"type": ["number", "null"]},
+        "live_market_score": {"type": ["number", "null"]},
+        "dynamic_score": {"type": ["number", "null"]},
+        "slow_weight": {"type": ["number", "null"]},
+        "live_weight": {"type": ["number", "null"]},
+        "context_age_seconds": {"type": ["number", "null"]},
+        "qualitative_score": {"type": ["number", "null"]}
+        ,"llm_score": {"type": ["number", "null"]}
+        ,"discovery_timestamp": {"type": ["string", "null"]}
+        ,"watchlist_timestamp": {"type": ["string", "null"]}
+        ,"trade_ready_timestamp": {"type": ["string", "null"]}
+        ,"state_transition_history": {"type": "array", "items": {"type": "object"}}
+      }
+    }
+  }
+}

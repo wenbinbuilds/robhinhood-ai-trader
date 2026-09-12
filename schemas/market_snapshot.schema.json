@@ -1,0 +1,343 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "data_source",
+    "generated_at",
+    "mcp_status",
+    "mcp_access_path",
+    "status_detail",
+    "account",
+    "portfolio",
+    "positions",
+    "open_orders",
+    "daily_realized_pnl",
+    "market",
+    "scanner",
+    "candidate_data",
+    "shadow_position_data",
+    "connectivity_checks",
+    "warnings",
+    "errors"
+  ],
+  "properties": {
+    "data_source": {"type": "string", "const": "ROBINHOOD_MCP"},
+    "generated_at": {"type": "string"},
+    "mcp_status": {
+      "type": "string",
+      "enum": ["CONNECTED", "MCP_UNAVAILABLE", "MCP_NOT_AUTHENTICATED", "ROBINHOOD_ERROR"]
+    },
+    "mcp_access_path": {"type": "string", "enum": ["DIRECT_MCP", "CUSTOM_MCP", "CODEX_PLUGIN", "UNKNOWN"]},
+    "status_detail": {"type": "string"},
+    "account": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["is_agentic_account", "nickname", "account_type", "brokerage_trading_type", "state"],
+      "properties": {
+        "is_agentic_account": {"type": "boolean"},
+        "nickname": {"type": ["string", "null"]},
+        "account_type": {"type": ["string", "null"]},
+        "brokerage_trading_type": {"type": ["string", "null"]},
+        "state": {"type": ["string", "null"]}
+      }
+    },
+    "portfolio": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["portfolio_value", "buying_power", "unleveraged_buying_power", "cash", "equity_value", "currency"],
+      "properties": {
+        "portfolio_value": {"type": ["string", "null"]},
+        "buying_power": {"type": ["string", "null"]},
+        "unleveraged_buying_power": {"type": ["string", "null"]},
+        "cash": {"type": ["string", "null"]},
+        "equity_value": {"type": ["string", "null"]},
+        "currency": {"type": ["string", "null"]}
+      }
+    },
+    "positions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["symbol", "quantity", "average_buy_price", "current_price", "intraday_quantity", "position_type"],
+        "properties": {
+          "symbol": {"type": "string"},
+          "quantity": {"type": "string"},
+          "average_buy_price": {"type": ["string", "null"]},
+          "current_price": {"type": ["string", "null"]},
+          "intraday_quantity": {"type": ["string", "null"]},
+          "position_type": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "open_orders": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["symbol", "side", "state", "quantity", "dollar_amount", "price", "stop_price", "created_at"],
+        "properties": {
+          "symbol": {"type": "string"},
+          "side": {"type": "string"},
+          "state": {"type": "string"},
+          "quantity": {"type": ["string", "null"]},
+          "dollar_amount": {"type": ["string", "null"]},
+          "price": {"type": ["string", "null"]},
+          "stop_price": {"type": ["string", "null"]},
+          "created_at": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "daily_realized_pnl": {"type": ["string", "number", "null"]},
+    "market": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "is_regular_session", "as_of", "direction", "benchmarks", "volatility_context"],
+      "properties": {
+        "status": {"type": "string", "enum": ["OPEN", "CLOSED", "UNKNOWN"]},
+        "is_regular_session": {"type": ["boolean", "null"]},
+        "as_of": {"type": "string"},
+        "direction": {"type": "string", "enum": ["BULLISH", "BEARISH", "MIXED", "UNKNOWN"]},
+        "volatility_context": {"type": ["string", "null"]},
+        "benchmarks": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/benchmark"},
+          "maxItems": 2
+        }
+      }
+    },
+    "scanner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "scan_name", "scan_id", "lifecycle_action", "criteria", "sort_configuration", "result_count", "candidates"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["OK", "SKIPPED_MARKET_CLOSED", "CREATE_FAILED", "UPDATE_FAILED", "RUN_FAILED", "ERROR", "NOT_ATTEMPTED"]
+        },
+        "scan_name": {"type": ["string", "null"]},
+        "scan_id": {"type": ["string", "null"]},
+        "lifecycle_action": {
+          "type": "string",
+          "enum": ["REUSED", "CREATED", "UPDATED", "SKIPPED", "FAILED", "NOT_ATTEMPTED"]
+        },
+        "criteria": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["filter_type", "filter_type_enum", "predicate", "values", "interval", "length", "plot", "expression"],
+            "properties": {
+              "filter_type": {"type": ["string", "null"]},
+              "filter_type_enum": {"type": ["string", "null"]},
+              "predicate": {"type": "string"},
+              "values": {"type": "array", "items": {"type": "string"}},
+              "interval": {"type": ["string", "null"]},
+              "length": {"type": ["integer", "null"]},
+              "plot": {"type": ["string", "null"]},
+              "expression": {"type": ["string", "null"]}
+            }
+          }
+        },
+        "sort_configuration": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["column", "direction"],
+          "properties": {
+            "column": {"type": ["string", "null"]},
+            "direction": {"type": ["string", "null"], "enum": ["asc", "desc", null]}
+          }
+        },
+        "result_count": {"type": "integer", "minimum": 0},
+        "candidates": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["symbol", "instrument_type", "columns"],
+            "properties": {
+              "symbol": {"type": "string"},
+              "instrument_type": {"type": "string"},
+              "columns": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["name", "value"],
+                  "properties": {
+                    "name": {"type": "string"},
+                    "value": {"type": "string"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "candidate_data": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/candidate"}
+    },
+    "shadow_position_data": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/candidate"}
+    },
+    "connectivity_checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "NVDA": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "detail", "market_data"],
+          "properties": {
+            "status": {"type": "string", "enum": ["OK", "ERROR", "UNAVAILABLE"]},
+            "detail": {"type": "string"},
+            "market_data": {
+              "anyOf": [
+                {"$ref": "#/$defs/candidate"},
+                {"type": "null"}
+              ]
+            }
+          }
+        }
+      }
+    },
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "errors": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "benchmark": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["symbol", "current_price", "vwap", "ema9", "ema20", "previous_close", "intraday_change_percent", "candles", "unavailable_values"],
+      "properties": {
+        "symbol": {"type": "string", "enum": ["SPY", "QQQ"]},
+        "current_price": {"type": ["number", "null"]},
+        "vwap": {"type": ["number", "null"]},
+        "ema9": {"type": ["number", "null"]},
+        "ema20": {"type": ["number", "null"]},
+        "previous_close": {"type": ["number", "null"]},
+        "intraday_change_percent": {"type": ["number", "null"]},
+        "candles": {"type": "array", "items": {"$ref": "#/$defs/candle"}},
+        "unavailable_values": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "candle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["begins_at", "open", "high", "low", "close", "volume", "interpolated"],
+      "properties": {
+        "begins_at": {"type": "string"},
+        "open": {"type": "number"},
+        "high": {"type": "number"},
+        "low": {"type": "number"},
+        "close": {"type": "number"},
+        "volume": {"type": "number"},
+        "interpolated": {"type": "boolean"}
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "symbol", "current_price", "bid", "ask", "quote_as_of", "candidate_quote_retrieved_at", "volume",
+        "relative_volume", "vwap", "ema9", "ema20", "rsi14", "macd",
+        "macd_signal", "macd_histogram", "intraday_support_reference", "intraday_resistance_reference",
+        "intraday_high", "intraday_low", "previous_close", "market_direction",
+        "sector", "industry", "sector_benchmark", "news_items",
+        "candles", "level2", "unavailable_values"
+      ],
+      "properties": {
+        "symbol": {"type": "string"},
+        "current_price": {"type": ["number", "null"]},
+        "bid": {"type": ["number", "null"]},
+        "ask": {"type": ["number", "null"]},
+        "quote_as_of": {"type": ["string", "null"]},
+        "quote_timestamp_field": {"type": ["string", "null"]},
+        "quote_request_started_at": {"type": ["string", "null"]},
+        "candidate_quote_retrieved_at": {"type": ["string", "null"]},
+        "quote_freshness_source": {"type": "string", "enum": ["exchange_timestamp", "retrieval_timestamp", "unavailable"]},
+        "volume": {"type": ["number", "null"]},
+        "relative_volume": {"type": ["number", "null"]},
+        "vwap": {"type": ["number", "null"]},
+        "ema9": {"type": ["number", "null"]},
+        "ema20": {"type": ["number", "null"]},
+        "rsi14": {"type": ["number", "null"]},
+        "macd": {"type": ["number", "null"]},
+        "macd_signal": {"type": ["number", "null"]},
+        "macd_histogram": {"type": ["number", "null"]},
+        "intraday_support_reference": {"type": ["number", "null"]},
+        "intraday_resistance_reference": {"type": ["number", "null"]},
+        "intraday_high": {"type": ["number", "null"]},
+        "intraday_low": {"type": ["number", "null"]},
+        "previous_close": {"type": ["number", "null"]},
+        "market_direction": {"type": ["string", "null"]},
+        "sector": {"type": ["string", "null"]},
+        "industry": {"type": ["string", "null"]},
+        "sector_benchmark": {
+          "anyOf": [
+            {"$ref": "#/$defs/sector_benchmark"},
+            {"type": "null"}
+          ]
+        },
+        "news_items": {"type": "array", "items": {"$ref": "#/$defs/news_item"}},
+        "candles": {"type": "array", "items": {"$ref": "#/$defs/candle"}},
+        "level2": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["updated_at", "best_bid", "best_ask", "best_bid_size", "best_ask_size"],
+              "properties": {
+                "updated_at": {"type": ["string", "null"]},
+                "best_bid": {"type": ["number", "null"]},
+                "best_ask": {"type": ["number", "null"]},
+                "best_bid_size": {"type": ["number", "null"]},
+                "best_ask_size": {"type": ["number", "null"]}
+              }
+            },
+            {"type": "null"}
+          ]
+        },
+        "unavailable_values": {"type": "array", "items": {"type": "string"}},
+        "collection_status": {"type": "string", "enum": ["COMPLETE", "DATA_UNAVAILABLE"]},
+        "collection_error": {"type": ["string", "null"]}
+      }
+    },
+    "sector_benchmark": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["symbol", "current_price", "vwap", "ema9", "ema20", "intraday_change_percent", "unavailable_values"],
+      "properties": {
+        "symbol": {"type": "string"},
+        "current_price": {"type": ["number", "null"]},
+        "vwap": {"type": ["number", "null"]},
+        "ema9": {"type": ["number", "null"]},
+        "ema20": {"type": ["number", "null"]},
+        "intraday_change_percent": {"type": ["number", "null"]},
+        "unavailable_values": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "news_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["headline", "source", "published_at", "url", "summary", "source_quality", "catalyst_type", "sentiment", "importance"],
+      "properties": {
+        "headline": {"type": "string"},
+        "source": {"type": "string"},
+        "published_at": {"type": ["string", "null"]},
+        "url": {"type": ["string", "null"]},
+        "summary": {"type": "string"},
+        "source_quality": {"type": "string", "enum": ["PRIMARY_COMPANY_SOURCE", "REGULATORY_FILING", "MAJOR_WIRE", "MAJOR_FINANCIAL_NEWS", "OTHER_REPUTABLE", "LOW_CONFIDENCE"]},
+        "catalyst_type": {"type": "string", "enum": ["EARNINGS", "GUIDANCE", "FDA", "CLINICAL_TRIAL", "M_AND_A", "SEC_FILING", "PRODUCT", "CUSTOMER_DEAL", "ANALYST_RATING", "LEGAL", "REGULATORY", "MACRO", "SECTOR_MOVE", "MANAGEMENT", "OTHER", "NONE"]},
+        "sentiment": {"type": "string", "enum": ["VERY_POSITIVE", "POSITIVE", "NEUTRAL", "NEGATIVE", "VERY_NEGATIVE", "UNKNOWN"]},
+        "importance": {"type": ["number", "null"], "minimum": 0, "maximum": 1}
+      }
+    }
+  }
+}

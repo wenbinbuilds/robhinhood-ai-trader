@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["generated_at", "rows", "failures", "warnings"],
+  "properties": {
+    "generated_at": {"type": "string"},
+    "rows": {"type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/row"}},
+    "failures": {"type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/failure"}},
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "candle": {
+      "type": "object", "additionalProperties": false,
+      "required": ["begins_at", "open", "high", "low", "close", "volume", "interpolated"],
+      "properties": {
+        "begins_at": {"type": "string"}, "open": {"type": "number"}, "high": {"type": "number"},
+        "low": {"type": "number"}, "close": {"type": "number"}, "volume": {"type": "number"},
+        "interpolated": {"type": "boolean"}
+      }
+    },
+    "row": {
+      "type": "object", "additionalProperties": false,
+      "required": ["symbol", "current_price", "bid", "ask", "quote_as_of", "quote_retrieved_at", "previous_close", "relative_volume", "sector", "industry", "candles", "unavailable_values"],
+      "properties": {
+        "symbol": {"type": "string"}, "current_price": {"type": ["number", "null"]},
+        "bid": {"type": ["number", "null"]}, "ask": {"type": ["number", "null"]},
+        "quote_as_of": {"type": ["string", "null"]}, "quote_retrieved_at": {"type": ["string", "null"]},
+        "previous_close": {"type": ["number", "null"]}, "relative_volume": {"type": ["number", "null"]},
+        "sector": {"type": ["string", "null"]}, "industry": {"type": ["string", "null"]},
+        "candles": {"type": "array", "maxItems": 50, "items": {"$ref": "#/$defs/candle"}},
+        "unavailable_values": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "failure": {
+      "type": "object", "additionalProperties": false,
+      "required": ["symbol", "status", "detail"],
+      "properties": {"symbol": {"type": "string"}, "status": {"type": "string", "enum": ["DATA_UNAVAILABLE"]}, "detail": {"type": "string"}}
+    }
+  }
+}

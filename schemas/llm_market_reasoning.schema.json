@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/schemas/llm_market_reasoning.schema.json",
+  "title": "LLM market reasoning result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "prompt_version", "analysis_timestamp", "candidates"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "1.0"},
+    "prompt_version": {"type": "string", "const": "v1"},
+    "analysis_timestamp": {"type": "string", "minLength": 1},
+    "candidates": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/candidate"}
+    }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "url"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "url": {"type": ["string", "null"]}
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "summary", "published_at", "age_minutes", "source_quality", "sources"],
+      "properties": {
+        "event_id": {"type": "string", "minLength": 1},
+        "summary": {"type": "string", "minLength": 1},
+        "published_at": {"type": ["string", "null"]},
+        "age_minutes": {"type": ["number", "null"], "minimum": 0},
+        "source_quality": {"type": "string", "enum": ["PRIMARY", "REGULATORY", "MAJOR_WIRE", "MAJOR_FINANCIAL_NEWS", "OTHER_REPUTABLE", "LOW_CONFIDENCE", "UNKNOWN"]},
+        "sources": {"type": "array", "items": {"$ref": "#/$defs/source"}}
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["symbol", "news_analysis", "sector_analysis", "macro_analysis", "qualitative_analysis"],
+      "properties": {
+        "symbol": {"type": "string", "pattern": "^[A-Z][A-Z0-9.-]{0,9}$"},
+        "news_analysis": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "catalyst_found", "catalyst_type", "sentiment", "importance", "freshness_score", "source_quality_score", "explains_price_move", "event_summary", "supporting_events", "conflicting_events"],
+          "properties": {
+            "status": {"type": "string", "enum": ["AVAILABLE", "UNAVAILABLE"]},
+            "catalyst_found": {"type": "boolean"},
+            "catalyst_type": {"type": "string", "enum": ["EARNINGS", "GUIDANCE", "FDA", "CLINICAL_TRIAL", "M_AND_A", "SEC_FILING", "PRODUCT", "CUSTOMER_DEAL", "ANALYST_ACTION", "LEGAL", "REGULATORY", "MANAGEMENT", "MACRO", "SECTOR", "OTHER", "NONE"]},
+            "sentiment": {"type": "string", "enum": ["VERY_POSITIVE", "POSITIVE", "NEUTRAL", "MIXED", "NEGATIVE", "VERY_NEGATIVE", "UNKNOWN"]},
+            "importance": {"type": "number", "minimum": 0, "maximum": 1},
+            "freshness_score": {"type": "number", "minimum": 0, "maximum": 1},
+            "source_quality_score": {"type": "number", "minimum": 0, "maximum": 1},
+            "explains_price_move": {"type": ["boolean", "null"]},
+            "event_summary": {"type": "string"},
+            "supporting_events": {"type": "array", "items": {"$ref": "#/$defs/event"}},
+            "conflicting_events": {"type": "array", "items": {"$ref": "#/$defs/event"}}
+          }
+        },
+        "sector_analysis": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sector", "sector_bias", "reasoning", "important_sector_drivers"],
+          "properties": {
+            "sector": {"type": "string", "minLength": 1},
+            "sector_bias": {"type": "string", "enum": ["SUPPORTS", "NEUTRAL", "CONFLICTS", "UNKNOWN"]},
+            "reasoning": {"type": "string"},
+            "important_sector_drivers": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "macro_analysis": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["market_bias", "reasoning"],
+          "properties": {
+            "market_bias": {"type": "string", "enum": ["SUPPORTS", "NEUTRAL", "CONFLICTS", "UNKNOWN"]},
+            "reasoning": {"type": "string"}
+          }
+        },
+        "qualitative_analysis": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["proposed_direction", "setup_quality", "catalyst_quality", "continuation_probability_score", "conflicting_evidence_severity", "reasons_for", "reasons_against", "key_uncertainties", "summary"],
+          "properties": {
+            "proposed_direction": {"type": "string", "enum": ["LONG", "SHORT", "NO_DIRECTION"]},
+            "setup_quality": {"type": "number", "minimum": 0, "maximum": 1},
+            "catalyst_quality": {"type": "number", "minimum": 0, "maximum": 1},
+            "continuation_probability_score": {"type": "number", "minimum": 0, "maximum": 1},
+            "conflicting_evidence_severity": {"type": "number", "minimum": 0, "maximum": 1},
+            "reasons_for": {"type": "array", "items": {"type": "string"}},
+            "reasons_against": {"type": "array", "items": {"type": "string"}},
+            "key_uncertainties": {"type": "array", "items": {"type": "string"}},
+            "summary": {"type": "string"}
+          }
+        }
+      }
+    }
+  }
+}

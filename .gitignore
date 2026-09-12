@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+.robinhood-mcp/
+.DS_Store
+*.pem
+*.key
+
+# Runtime state can contain private portfolio, account, or session details.
+state/*
+!state/.gitkeep
+
+# Keep the directory but ignore generated cycle logs.
+logs/*.jsonl
+!logs/.gitkeep

@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["generated_at", "mcp_status", "status_detail", "account", "portfolio", "positions", "open_orders", "daily_realized_pnl", "market", "scanner", "warnings", "errors"],
+  "properties": {
+    "generated_at": {"type": "string"},
+    "mcp_status": {"type": "string", "enum": ["CONNECTED", "MCP_UNAVAILABLE", "MCP_NOT_AUTHENTICATED", "ROBINHOOD_ERROR"]},
+    "status_detail": {"type": "string"},
+    "account": {"$ref": "#/$defs/account"},
+    "portfolio": {"$ref": "#/$defs/portfolio"},
+    "positions": {"type": "array", "items": {"$ref": "#/$defs/position"}},
+    "open_orders": {"type": "array", "items": {"$ref": "#/$defs/order"}},
+    "daily_realized_pnl": {"type": ["string", "number", "null"]},
+    "market": {"$ref": "#/$defs/market"},
+    "scanner": {"$ref": "#/$defs/scanner"},
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "errors": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "account": {
+      "type": "object", "additionalProperties": false,
+      "required": ["is_agentic_account", "nickname", "account_type", "brokerage_trading_type", "state"],
+      "properties": {
+        "is_agentic_account": {"type": "boolean"}, "nickname": {"type": ["string", "null"]},
+        "account_type": {"type": ["string", "null"]}, "brokerage_trading_type": {"type": ["string", "null"]},
+        "state": {"type": ["string", "null"]}
+      }
+    },
+    "portfolio": {
+      "type": "object", "additionalProperties": false,
+      "required": ["portfolio_value", "buying_power", "unleveraged_buying_power", "cash", "equity_value", "currency"],
+      "properties": {
+        "portfolio_value": {"type": ["string", "null"]}, "buying_power": {"type": ["string", "null"]},
+        "unleveraged_buying_power": {"type": ["string", "null"]}, "cash": {"type": ["string", "null"]},
+        "equity_value": {"type": ["string", "null"]}, "currency": {"type": ["string", "null"]}
+      }
+    },
+    "position": {
+      "type": "object", "additionalProperties": false,
+      "required": ["symbol", "quantity", "average_buy_price", "current_price", "intraday_quantity", "position_type"],
+      "properties": {
+        "symbol": {"type": "string"}, "quantity": {"type": "string"},
+        "average_buy_price": {"type": ["string", "null"]}, "current_price": {"type": ["string", "null"]},
+        "intraday_quantity": {"type": ["string", "null"]}, "position_type": {"type": ["string", "null"]}
+      }
+    },
+    "order": {
+      "type": "object", "additionalProperties": false,
+      "required": ["symbol", "side", "state", "quantity", "dollar_amount", "price", "stop_price", "created_at"],
+      "properties": {
+        "symbol": {"type": "string"}, "side": {"type": "string"}, "state": {"type": "string"},
+        "quantity": {"type": ["string", "null"]}, "dollar_amount": {"type": ["string", "null"]},
+        "price": {"type": ["string", "null"]}, "stop_price": {"type": ["string", "null"]},
+        "created_at": {"type": ["string", "null"]}
+      }
+    },
+    "market": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "is_regular_session", "as_of"],
+      "properties": {
+        "status": {"type": "string", "enum": ["OPEN", "CLOSED", "UNKNOWN"]},
+        "is_regular_session": {"type": ["boolean", "null"]}, "as_of": {"type": "string"}
+      }
+    },
+    "scannerCandidate": {
+      "type": "object", "additionalProperties": false,
+      "required": ["symbol", "instrument_type", "last", "volume", "average_volume", "relative_volume", "percent_change"],
+      "properties": {
+        "symbol": {"type": "string"}, "instrument_type": {"type": "string"},
+        "last": {"type": ["number", "null"]}, "volume": {"type": ["number", "null"]},
+        "average_volume": {"type": ["number", "null"]}, "relative_volume": {"type": ["number", "null"]},
+        "percent_change": {"type": ["number", "null"]}
+      }
+    },
+    "scanner": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "scan_name", "scan_id", "lifecycle_action", "criteria", "sort_configuration", "result_count", "candidates"],
+      "properties": {
+        "status": {"type": "string", "enum": ["OK", "SKIPPED_MARKET_CLOSED", "CREATE_FAILED", "UPDATE_FAILED", "RUN_FAILED", "ERROR", "NOT_ATTEMPTED"]},
+        "scan_name": {"type": ["string", "null"]}, "scan_id": {"type": ["string", "null"]},
+        "lifecycle_action": {"type": "string", "enum": ["REUSED", "CREATED", "UPDATED", "SKIPPED", "FAILED", "NOT_ATTEMPTED"]},
+        "criteria": {"type": "array", "items": {"$ref": "#/$defs/criterion"}},
+        "sort_configuration": {"type": "object", "additionalProperties": false, "required": ["column", "direction"], "properties": {"column": {"type": ["string", "null"]}, "direction": {"type": ["string", "null"], "enum": ["asc", "desc", null]}}},
+        "result_count": {"type": "integer", "minimum": 0},
+        "candidates": {"type": "array", "maxItems": 250, "items": {"$ref": "#/$defs/scannerCandidate"}}
+      }
+    },
+    "criterion": {
+      "type": "object", "additionalProperties": false,
+      "required": ["filter_type", "filter_type_enum", "predicate", "values", "interval", "length", "plot", "expression"],
+      "properties": {
+        "filter_type": {"type": ["string", "null"]}, "filter_type_enum": {"type": ["string", "null"]},
+        "predicate": {"type": "string"}, "values": {"type": "array", "items": {"type": "string"}},
+        "interval": {"type": ["string", "null"]}, "length": {"type": ["integer", "null"]},
+        "plot": {"type": ["string", "null"]}, "expression": {"type": ["string", "null"]}
+      }
+    }
+  }
+}
