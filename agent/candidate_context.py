@@ -75,6 +75,19 @@ class CandidateContext:
     trade_ready_timestamp: str | None = None
     state_transition_history: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Canonical, non-secret technical inputs from the admitting slow cycle.
+    # A pre-execution quote refresh overlays this mapping without allowing
+    # absent/None partial fields to erase valid slow research.
+    canonical_market_data: dict[str, Any] = field(default_factory=dict)
+    qualitative_generated_at: str | None = None
+    qualitative_cache_hit: bool = False
+    qualitative_cache_age_seconds: float | None = None
+    episode_id: str = ''
+
+    def __post_init__(self):
+        if not self.episode_id:
+            from trading_runtime.setup_controller import episode_id
+            self.episode_id = episode_id(self.symbol, self.research_cycle_id)
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> CandidateContext:
@@ -95,6 +108,28 @@ class CandidateContext:
         expires = timestamp(self.expiration_timestamp)
         return expires is None or now.astimezone(timezone.utc) >= expires
 
+    def pre_execution_market_data(self) -> dict[str, Any]:
+        """Return the single canonical slow context used by entry revalidation."""
+
+        result = dict(self.canonical_market_data)
+        fallbacks = {
+            "symbol": self.symbol,
+            "current_price": self.analysis_price,
+            "bid": self.research_bid,
+            "ask": self.research_ask,
+            "vwap": self.research_vwap,
+            "ema9": self.research_ema9,
+            "intraday_support_reference": self.intraday_support_reference,
+            "intraday_resistance_reference": self.intraday_resistance_reference,
+            "market_direction": self.metadata.get("market_regime"),
+            "context_timestamp": self.research_timestamp,
+            "context_expires_at": self.expiration_timestamp,
+        }
+        for name, value in fallbacks.items():
+            if result.get(name) is None and value is not None:
+                result[name] = value
+        return result
+
 
 class CandidateContextStore:
     """One atomic JSON object shared by the slow and fast local threads."""
@@ -105,6 +140,8 @@ class CandidateContextStore:
         self.contexts: dict[str, CandidateContext] = {}
         self.generated_at: str | None = None
         self._load()
+        from trading_runtime.journal import EventJournal
+        self.journal = EventJournal(self.path.with_suffix('.episodes.jsonl'))
 
     def _load(self) -> None:
         try:
@@ -140,11 +177,12 @@ class CandidateContextStore:
             timestamp_text = now.astimezone(timezone.utc).isoformat()
             for context in contexts:
                 prior = current.get(context.symbol)
-                if prior is not None:
+                if prior is not None and (preserve_research or prior.episode_id == context.episode_id):
                     context.discovery_timestamp = prior.discovery_timestamp
                     context.watchlist_timestamp = prior.watchlist_timestamp
                     context.state_transition_history = list(prior.state_transition_history)
                     if preserve_research:
+                        context.episode_id = prior.episode_id
                         context.research_cycle_id = prior.research_cycle_id
                         context.research_timestamp = prior.research_timestamp
                         context.expiration_timestamp = prior.expiration_timestamp
@@ -166,6 +204,14 @@ class CandidateContextStore:
             }
             self.generated_at = now.astimezone(timezone.utc).isoformat()
             self.save()
+            from trading_runtime.journal import RuntimeEvent, RuntimeEventType
+            from trading_runtime.setup_controller import SetupController
+            for context in self.contexts.values():
+                self.journal.append(RuntimeEvent(
+                    RuntimeEventType.SLOW_ALPHA_READY, timestamp_text, context.symbol,
+                    context.episode_id, context.research_cycle_id,
+                    {'context': context.to_dict(), 'alpha': SetupController.alpha(context, now).to_dict()},
+                    event_id='research:' + context.episode_id))
 
     def remove(self, symbol: str) -> None:
         with self.lock:
@@ -241,6 +287,10 @@ def contexts_from_cycle(result: Mapping[str, Any], *, now: datetime) -> list[Can
         evidence = technical.get("evidence", [])
         conflicts = technical.get("conflicts", [])
         rules = validation.get("rules", []) if isinstance(validation, Mapping) else []
+        trace = reasoning.get("trace", {}) if isinstance(reasoning, Mapping) else {}
+        diagnostics = trace.get("diagnostics", {}) if isinstance(trace, Mapping) else {}
+        cache_rows = diagnostics.get("per_candidate", {}) if isinstance(diagnostics, Mapping) else {}
+        cache_detail = cache_rows.get(str(row.get("symbol", "")).upper(), {}) if isinstance(cache_rows, Mapping) else {}
         hard_rules = [
             item for item in rules
             if isinstance(item, Mapping)
@@ -287,6 +337,13 @@ def contexts_from_cycle(result: Mapping[str, Any], *, now: datetime) -> list[Can
             true_hard_gate_failures=true_hard_failures,
             signal_quality_failures=signal_quality_failures,
             metadata={
+                'score_provenance': {
+                    'technical': {'status': 'AVAILABLE', 'source': 'PYTHON_COMPLETED_CANDLES', 'source_timestamp': metrics.get('latest_completed_bar_timestamp')},
+                    'news': {'status': 'UNAVAILABLE' if row.get('news_context', {}).get('unavailable_fields') else 'UNKNOWN', 'source': 'NEWS_CONTEXT', 'context': str(row.get('news_context', {}).get('sentiment', 'UNKNOWN')), 'fallback_used': bool(row.get('news_context', {}).get('unavailable_fields'))},
+                    'sector': {'status': 'UNKNOWN', 'source': 'SECTOR_CONTEXT', 'context': str(row.get('sector_context', {}).get('sector', 'UNKNOWN'))},
+                    'market': {'status': 'UNKNOWN', 'source': 'MARKET_CONTEXT', 'context': str(row.get('market_context', {}).get('regime', 'UNKNOWN'))},
+                    'qualitative': {'status': 'AVAILABLE' if llm else 'UNAVAILABLE', 'source': config.CODEX_REASONING_MODEL, 'cache_hit': bool(cache_detail.get('cache_hit')), 'source_timestamp': cache_detail.get('generated_at')},
+                },
                 "sector": (
                     str(row.get("sector_context", {}).get("sector", "GENERAL"))
                     if isinstance(row.get("sector_context"), Mapping) else "GENERAL"
@@ -300,5 +357,54 @@ def contexts_from_cycle(result: Mapping[str, Any], *, now: datetime) -> list[Can
                     if signal_quality_failures else "FAST_WATCH_ADMITTED"
                 ),
             },
+            canonical_market_data={
+                **{
+                    name: metrics.get(name)
+                    for name in (
+                        "current_price", "bid", "ask", "quote_as_of",
+                        "quote_retrieved_at", "volume", "relative_volume",
+                        "vwap", "ema9", "ema20", "rsi14", "macd",
+                        "macd_signal", "macd_histogram", "intraday_high",
+                        "intraday_low", "previous_close", "level2",
+                    )
+                    if metrics.get(name) is not None
+                },
+                "symbol": str(row.get("symbol", "")).upper(),
+                "intraday_support_reference": _number(
+                    row.get("supporting_indicators", {}).get(
+                        "intraday_support_reference"
+                    )
+                ) if isinstance(row.get("supporting_indicators"), Mapping) else None,
+                "intraday_resistance_reference": _number(
+                    row.get("supporting_indicators", {}).get(
+                        "intraday_resistance_reference"
+                    )
+                ) if isinstance(row.get("supporting_indicators"), Mapping) else None,
+                "market_direction": (
+                    str(row.get("market_context", {}).get("regime", "UNKNOWN"))
+                    if isinstance(row.get("market_context"), Mapping) else "UNKNOWN"
+                ),
+                "candles": list(metrics.get("recent_5_minute_candles", []))
+                if isinstance(metrics.get("recent_5_minute_candles"), Sequence)
+                and not isinstance(metrics.get("recent_5_minute_candles"), (str, bytes))
+                else [],
+                "context_timestamp": timestamp_text,
+                "context_expires_at": expires,
+            },
+            qualitative_generated_at=(
+                str(cache_detail.get("generated_at"))
+                if isinstance(cache_detail, Mapping) and cache_detail.get("generated_at")
+                else str(trace.get("reasoning_invocation_timestamp"))
+                if isinstance(trace, Mapping) and trace.get("reasoning_invocation_timestamp")
+                else None
+            ),
+            qualitative_cache_hit=(
+                bool(cache_detail.get("cache_hit"))
+                if isinstance(cache_detail, Mapping) else False
+            ),
+            qualitative_cache_age_seconds=(
+                _number(cache_detail.get("cache_age_seconds"))
+                if isinstance(cache_detail, Mapping) else None
+            ),
         ))
     return contexts

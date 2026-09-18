@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
-from execution.models import ExecutionResult, TradePlan
+from execution.models import ExecutionResult, TradePlan, parse_timestamp
 from execution.order_state import ExecutionAuditLog
 from shadow.execution import ShadowExecutionEngine
 import config
@@ -30,7 +30,7 @@ class ShadowExecutor:
         if (not 0 <= age <= config.FAST_QUOTE_MAX_AGE_SECONDS
                 or quote.exit_price is None or quote.is_market_open is not True):
             return None
-        if request.reason not in {"STOP_HIT", "TARGET_HIT", "END_OF_DAY_EXIT", "HARD_RISK_EXIT"}:
+        if request.reason not in {"STOP_HIT", "TARGET_HIT", "END_OF_DAY_EXIT", "MISSED_EOD_RECOVERY_EXIT", "HARD_RISK_EXIT"}:
             raise ValueError("unsupported deterministic exit")
         with self.engine.portfolio.lock:
             position = next((p for p in self.engine.portfolio.state.open_positions if p.trade_id == request.trade_id), None)
@@ -41,6 +41,8 @@ class ShadowExecutor:
             if entry is None or quote.timestamp < entry or (latest and quote.timestamp < latest):
                 return None
             warnings = [] if quote.executable_bid else ["LAST_TRADE_EXIT_FALLBACK: reliable bid unavailable"]
+            position.quote_source = quote.source
+            position.last_price_timestamp = quote.timestamp.isoformat()
             trade = self.engine.close_at_price(
                 request.trade_id, quote.exit_price, request.reason, now=now,
                 exit_method="REALTIME_FAST_EXIT" if request.monitoring_mode == "REALTIME_FAST" else "DEGRADED_SNAPSHOT_EXIT",
@@ -56,6 +58,47 @@ class ShadowExecutor:
         *,
         now: datetime,
     ) -> ExecutionResult:
+        refresh = market_data.get("pre_execution_refresh")
+        refresh_at = (
+            parse_timestamp(refresh.get("timestamp"))
+            if isinstance(refresh, Mapping) else None
+        )
+        refresh_age = (
+            (now.astimezone(timezone.utc) - refresh_at).total_seconds()
+            if refresh_at is not None else None
+        )
+        quote_age = refresh.get("refreshed_quote_age_seconds") if isinstance(refresh, Mapping) else None
+        if (
+            not isinstance(refresh, Mapping)
+            or refresh.get("status") != "APPROVED"
+            or refresh_age is None
+            or not 0 <= refresh_age <= config.PRE_EXECUTION_MAX_QUOTE_AGE_SECONDS
+            or not isinstance(quote_age, (int, float))
+            or not 0 <= float(quote_age) <= config.PRE_EXECUTION_MAX_QUOTE_AGE_SECONDS
+        ):
+            result = ExecutionResult(
+                trade_id=plan.trade_id,
+                symbol=plan.symbol,
+                requested_action=plan.side,
+                order_type=plan.entry_type,
+                requested_quantity=plan.quantity,
+                requested_price=plan.entry_price,
+                status="REJECTED",
+                timestamp=now.astimezone(timezone.utc).isoformat(),
+                reconciliation_state="LOCAL_SHADOW",
+                errors=("PRE_EXECUTION_REFRESH_REQUIRED",),
+                metadata={"local_only": True},
+            )
+            if self.audit_log is not None:
+                self.audit_log.append({
+                    "event": "PRE_EXECUTION_REFRESH",
+                    "timestamp": result.timestamp,
+                    "trade_id": plan.trade_id,
+                    "symbol": plan.symbol,
+                    "status": "REJECTED",
+                    "rejection_reason": "PRE_EXECUTION_REFRESH_REQUIRED",
+                })
+            return result
         position, detail = self.engine.open_trade_plan(plan, market_data, now=now)
         status = "FILLED" if position is not None else "REJECTED"
         reason = str(detail.get("reason", "")) if position is None else ""

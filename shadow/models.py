@@ -61,6 +61,23 @@ class ShadowPosition:
     watchlist_timestamp: str | None = None
     trade_ready_timestamp: str | None = None
     state_transition_history: list[dict[str, Any]] = field(default_factory=list)
+    episode_id: str = ''
+    research_cycle_id: str = ''
+    entry_intent_id: str = ''
+    strategy_id: str = ''
+    risk_allocated: float = 0.0
+    capital_allocated: float = 0.0
+    quoted_entry_bid: float | None = None
+    quoted_entry_ask: float | None = None
+    estimated_spread_cost: float = 0.0
+    maximum_favorable_excursion: float = 0.0
+    maximum_adverse_excursion: float = 0.0
+    profit_protection_armed: bool = False
+
+    def __post_init__(self):
+        self.episode_id = self.episode_id or 'legacy:' + self.trade_id
+        self.entry_intent_id = self.entry_intent_id or 'entry:' + self.episode_id
+        self.strategy_id = self.strategy_id or self.strategy
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ShadowPosition:
@@ -112,6 +129,31 @@ class ShadowTrade:
     watchlist_timestamp: str | None = None
     trade_ready_timestamp: str | None = None
     state_transition_history: list[dict[str, Any]] = field(default_factory=list)
+    episode_id: str = ''
+    research_cycle_id: str = ''
+    entry_intent_id: str = ''
+    exit_intent_id: str = ''
+    price_source: str | None = None
+    quote_timestamp: str | None = None
+    strategy_id: str = ''
+    risk_allocated: float = 0.0
+    capital_allocated: float = 0.0
+    quoted_entry_bid: float | None = None
+    quoted_entry_ask: float | None = None
+    quoted_exit_bid: float | None = None
+    quoted_exit_ask: float | None = None
+    estimated_spread_cost: float = 0.0
+    entry_slippage_cost: float = 0.0
+    exit_slippage_cost: float = 0.0
+    holding_time_seconds: float = 0.0
+    maximum_favorable_excursion: float = 0.0
+    maximum_adverse_excursion: float = 0.0
+
+    def __post_init__(self):
+        self.episode_id = self.episode_id or 'legacy:' + self.trade_id
+        self.entry_intent_id = self.entry_intent_id or 'entry:' + self.episode_id
+        self.exit_intent_id = self.exit_intent_id or 'exit:' + self.trade_id
+        self.strategy_id = self.strategy_id or self.strategy
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ShadowTrade:

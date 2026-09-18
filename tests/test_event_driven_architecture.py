@@ -10,7 +10,8 @@ from threading import Event, Thread
 import pytest
 
 import config
-from agent.models import LlmReasoningResult, ReasoningTrace
+from agent.models import LlmCandidateAnalysis, LlmReasoningResult, ReasoningTrace
+from test_llm_reasoning import candidate as llm_candidate
 from event_driven.alpha import AlphaCombiner
 from event_driven.bus import InProcessEventBus
 from event_driven.events import (
@@ -204,8 +205,9 @@ def test_reasoning_trigger_policy_changes_only_for_meaningful_evidence():
 
 def _reasoning_result(now=NOW):
     return LlmReasoningResult(
-        status="AVAILABLE", candidates=(),
-        trace=ReasoningTrace("FAKE", None, now.isoformat(), .1, 0, "1", "1", "SUCCESS", None),
+        status="AVAILABLE",
+        candidates=(LlmCandidateAnalysis.from_mapping(llm_candidate("ACME")),),
+        trace=ReasoningTrace("FAKE", None, now.isoformat(), .1, 1, "1", "1", "SUCCESS", None),
     )
 
 
@@ -234,10 +236,181 @@ def test_llm_context_reused_until_meaningful_event():
     provider = EventDrivenReasoningProvider(fake)
     first = provider.reason(_reasoning_payload(), expected_symbols=["ACME"], now=NOW)
     second = provider.reason({**_reasoning_payload(), "analysis_timestamp": (NOW + timedelta(seconds=2)).isoformat()}, expected_symbols=["ACME"], now=NOW)
-    provider.reason(_reasoning_payload((NOW + timedelta(minutes=5)).isoformat()), expected_symbols=["ACME"], now=NOW)
+    third = provider.reason(
+        _reasoning_payload((NOW + timedelta(minutes=5)).isoformat()),
+        expected_symbols=["ACME"], now=NOW,
+    )
     assert first.status == second.status == "AVAILABLE"
     assert second.trace.status == "CACHED"
+    assert third.trace.status == "CACHED"
+    assert fake.calls == 1
+
+
+def test_qualitative_cache_refreshes_only_for_semantic_evidence():
+    class Fake:
+        def __init__(self): self.calls = 0
+        def reason(self, payload, *, expected_symbols, now):
+            self.calls += 1
+            return _reasoning_result(now)
+    fake = Fake()
+    provider = EventDrivenReasoningProvider(fake)
+    base = _reasoning_payload()
+    first = provider.reason(base, expected_symbols=["ACME"], now=NOW)
+    original = first.trace.reasoning_invocation_timestamp
+
+    numeric = _reasoning_payload((NOW + timedelta(minutes=5)).isoformat())
+    numeric["candidates"][0]["deterministic_technical_metrics"].update(
+        rsi14=72, macd=-0.4, macd_signal=-0.2,
+    )
+    cached = provider.reason(
+        numeric, expected_symbols=["ACME"], now=NOW + timedelta(minutes=5)
+    )
+    assert cached.trace.status == "CACHED"
+    assert cached.trace.reasoning_invocation_timestamp == original
+    assert (
+        cached.candidates[0].qualitative_analysis
+        == first.candidates[0].qualitative_analysis
+    )
+    assert cached.trace.diagnostics["per_candidate"]["ACME"]["cache_age_seconds"] == 300
+    assert fake.calls == 1
+
+    news = _reasoning_payload()
+    news["candidates"][0]["deterministic_news_event_clusters"] = [
+        {"event_id": "new-filing", "catalyst_type": "SEC_FILING",
+         "published_at": NOW.isoformat(), "sources": []}
+    ]
+    refreshed = provider.reason(
+        news, expected_symbols=["ACME"], now=NOW + timedelta(minutes=6)
+    )
+    assert refreshed.trace.diagnostics["per_candidate"]["ACME"]["reason"] == "NEW_MATERIAL_NEWS"
     assert fake.calls == 2
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        (lambda value: value["candidates"][0]["deterministic_sector_classification"].update(bias="BEARISH"), "SECTOR_REGIME_CHANGE"),
+        (lambda value: value["broad_market_context"]["deterministic_interpretation"].update(regime="BEARISH"), "MARKET_REGIME_CHANGE"),
+    ],
+)
+def test_sector_and_market_regime_changes_refresh_llm(mutation, reason):
+    class Fake:
+        def __init__(self): self.calls = 0
+        def reason(self, payload, *, expected_symbols, now):
+            self.calls += 1
+            return _reasoning_result(now)
+    fake = Fake()
+    provider = EventDrivenReasoningProvider(fake)
+    provider.reason(_reasoning_payload(), expected_symbols=["ACME"], now=NOW)
+    changed = _reasoning_payload()
+    mutation(changed)
+    result = provider.reason(
+        changed, expected_symbols=["ACME"], now=NOW + timedelta(minutes=1)
+    )
+    assert result.trace.diagnostics["per_candidate"]["ACME"]["reason"] == reason
+    assert fake.calls == 2
+
+
+def test_qualitative_cache_ttl_is_independent_of_candidate_ttl():
+    class Fake:
+        def __init__(self): self.calls = 0
+        def reason(self, payload, *, expected_symbols, now):
+            self.calls += 1
+            return _reasoning_result(now)
+    fake = Fake()
+    provider = EventDrivenReasoningProvider(fake, ttl_seconds=600)
+    provider.reason(_reasoning_payload(), expected_symbols=["ACME"], now=NOW)
+    still_cached = provider.reason(
+        _reasoning_payload(), expected_symbols=["ACME"],
+        now=NOW + timedelta(seconds=301),
+    )
+    expired = provider.reason(
+        _reasoning_payload(), expected_symbols=["ACME"],
+        now=NOW + timedelta(seconds=601),
+    )
+    assert still_cached.trace.status == "CACHED"
+    assert expired.trace.diagnostics["per_candidate"]["ACME"]["reason"] == "QUALITATIVE_CONTEXT_EXPIRED"
+    assert fake.calls == 2
+
+
+def test_only_semantic_cache_misses_are_batched_and_symbols_stay_isolated():
+    class Fake:
+        def __init__(self): self.calls = []
+        def reason(self, payload, *, expected_symbols, now):
+            self.calls.append(tuple(expected_symbols))
+            return LlmReasoningResult(
+                status="AVAILABLE",
+                candidates=tuple(
+                    LlmCandidateAnalysis.from_mapping(llm_candidate(symbol))
+                    for symbol in expected_symbols
+                ),
+                trace=ReasoningTrace(
+                    "FAKE", "gpt-5.6-sol", now.isoformat(), .1,
+                    len(expected_symbols), "1", "1", "SUCCESS", None,
+                ),
+            )
+    fake = Fake()
+    provider = EventDrivenReasoningProvider(fake)
+    first = _reasoning_payload()
+    beta = dict(first["candidates"][0])
+    beta["symbol"] = "BETA"
+    first["candidates"] = [first["candidates"][0], beta]
+    provider.reason(first, expected_symbols=["ACME", "BETA"], now=NOW)
+
+    changed = _reasoning_payload()
+    beta_changed = dict(changed["candidates"][0])
+    beta_changed["symbol"] = "BETA"
+    beta_changed["deterministic_news_event_clusters"] = [{
+        "event_id": "beta-news", "catalyst_type": "PRODUCT",
+        "published_at": NOW.isoformat(), "sources": [],
+    }]
+    changed["candidates"] = [changed["candidates"][0], beta_changed]
+    result = provider.reason(
+        changed, expected_symbols=["ACME", "BETA"],
+        now=NOW + timedelta(minutes=5),
+    )
+    assert fake.calls == [("ACME", "BETA"), ("BETA",)]
+    assert set(result.by_symbol()) == {"ACME", "BETA"}
+    assert result.trace.diagnostics["cache_hits"] == 1
+    assert result.trace.diagnostics["cache_misses"] == 1
+
+
+def test_malformed_batch_is_retried_per_symbol_for_failure_isolation():
+    class Fake:
+        def __init__(self): self.calls = []
+        def reason(self, payload, *, expected_symbols, now):
+            symbols = tuple(expected_symbols)
+            self.calls.append(symbols)
+            if len(symbols) > 1 or symbols == ("BETA",):
+                return LlmReasoningResult(
+                    status="UNAVAILABLE", candidates=(),
+                    trace=ReasoningTrace(
+                        "FAKE", None, now.isoformat(), .1, len(symbols),
+                        "1", "1", "ERROR", "LLM_REASONING_SCHEMA_VIOLATION",
+                    ),
+                    failure_reason="LLM_REASONING_SCHEMA_VIOLATION",
+                )
+            return LlmReasoningResult(
+                status="AVAILABLE",
+                candidates=(LlmCandidateAnalysis.from_mapping(llm_candidate("ACME")),),
+                trace=ReasoningTrace(
+                    "FAKE", None, now.isoformat(), .1, 1,
+                    "1", "1", "SUCCESS", None,
+                ),
+            )
+    payload = _reasoning_payload()
+    beta = dict(payload["candidates"][0])
+    beta["symbol"] = "BETA"
+    payload["candidates"] = [payload["candidates"][0], beta]
+    fake = Fake()
+    result = EventDrivenReasoningProvider(fake).reason(
+        payload, expected_symbols=["ACME", "BETA"], now=NOW
+    )
+    assert fake.calls == [("ACME", "BETA"), ("ACME",), ("BETA",)]
+    assert result.status == "AVAILABLE"
+    assert set(result.by_symbol()) == {"ACME"}
+    assert result.failure_reason == "PARTIAL_LLM_FAILURE:BETA"
+    assert result.trace.status == "PARTIAL_SUCCESS"
 
 
 def test_llm_latency_is_separate_from_quote_state(tmp_path):

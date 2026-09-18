@@ -143,7 +143,7 @@ class ExecutionGuard:
         )
         check(
             "quote_fresh",
-            fresh(context.quote_timestamp, config.MAX_QUOTE_AGE_SECONDS),
+            fresh(context.quote_timestamp, config.PRE_EXECUTION_MAX_QUOTE_AGE_SECONDS),
             "STALE_QUOTE",
         )
         check(
@@ -153,7 +153,7 @@ class ExecutionGuard:
         )
         check(
             "market_data_matches_plan",
-            fresh(plan.market_data_timestamp, config.MAX_QUOTE_AGE_SECONDS),
+            fresh(plan.market_data_timestamp, config.PRE_EXECUTION_MAX_QUOTE_AGE_SECONDS),
             "STALE_PLAN_MARKET_DATA",
         )
         check(

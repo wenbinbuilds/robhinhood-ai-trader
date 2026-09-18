@@ -41,6 +41,30 @@ class _Quotes:
         }
 
 
+class _PreExecutionRefresh:
+    def refresh_symbol(self, symbol: str, *, now: datetime):
+        candles = []
+        for index in range(6):
+            opened = 99.0 + index * .35
+            candles.append({
+                "begins_at": (now - timedelta(minutes=30 - index * 5)).isoformat(),
+                "open": opened, "high": opened + .55, "low": opened - .2,
+                "close": opened + .4, "volume": 150_000 + index * 10_000,
+                "interpolated": False,
+            })
+        return {
+            "symbol": symbol, "current_price": 101.0, "bid": 100.99,
+            "ask": 101.01, "quote_as_of": now.isoformat(),
+            "volume": 3_500_000, "relative_volume": 1.8,
+            "vwap": 100.2, "ema9": 100.6, "ema20": 99.5,
+            "rsi14": 61, "macd": .8, "macd_signal": .45,
+            "macd_histogram": .35, "intraday_support_reference": 98.5,
+            "intraday_resistance_reference": 105,
+            "intraday_low": 97.9, "intraday_high": 105,
+            "market_direction": "BULLISH", "candles": candles,
+        }
+
+
 def _context(symbol: str, now: datetime) -> CandidateContext:
     return CandidateContext(
         symbol=symbol, research_cycle_id="simulation-cycle", research_timestamp=now.isoformat(),
@@ -77,6 +101,7 @@ def run_deterministic_shadow_simulation(base_dir: str | Path | None = None) -> d
         context_store, engine, events_path=root / "candidate.jsonl",
         score_history_path=root / "scores.jsonl",
         scorer=_ScoreSequence([.57, .78, .88, .88]), event_orchestrator=runtime,
+        pre_execution_refresher=_PreExecutionRefresh(),
     )
     combined_path = []
     for seconds in (15, 70, 200, 202):
@@ -104,6 +129,7 @@ def run_deterministic_shadow_simulation(base_dir: str | Path | None = None) -> d
         blocked_store, engine, events_path=root / "blocked.jsonl",
         score_history_path=root / "blocked_scores.jsonl",
         scorer=_ScoreSequence([1, 1]),
+        pre_execution_refresher=_PreExecutionRefresh(),
     )
     for seconds in (1, 3):
         at = now + timedelta(seconds=seconds)

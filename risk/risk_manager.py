@@ -94,6 +94,24 @@ class RiskManager:
     def __init__(self, limits: RiskLimits | None = None) -> None:
         self.limits = limits or RiskLimits()
 
+    def evaluate_geometry(self, geometry, context):
+        """Consume fixed geometry, never change its levels or consult alpha."""
+        from trading_runtime.contracts import RiskDecision
+        if not geometry.valid:
+            raise ValueError('GEOMETRY_NOT_VALID')
+        result = self.evaluate(RiskRequest(
+            account_equity=context.account_equity, entry_price=geometry.entry,
+            stop_price=geometry.stop, daily_realized_pnl=context.daily_realized_pnl,
+            open_positions=context.open_positions, trades_today=context.trades_today,
+            available_buying_power=context.available_buying_power))
+        decision = RiskDecision(
+            geometry.episode_id, geometry.symbol, result.approved, None,
+            result.max_shares if result.approved else 0, float(result.theoretical_dollar_risk),
+            float(result.theoretical_dollar_risk) / float(context.account_equity) if context.account_equity else None,
+            'UNAVAILABLE' if context.daily_realized_pnl is None else
+            'BLOCKED' if 'daily loss limit reached' in result.reasons else 'WITHIN_LIMIT', result.reasons)
+        return result, decision
+
     def maximum_position_dollars(self, account_equity: DecimalLike) -> Decimal:
         equity = _decimal(account_equity, "account_equity")
         if equity <= 0:

@@ -72,6 +72,7 @@ class StateTransition:
 @dataclass(slots=True)
 class MarketState:
     symbol: str
+    episode_id: str = ''
     state: CandidateState = CandidateState.DISCOVERED
     latest_quote: dict[str, Any] | None = None
     latest_quote_timestamp: str | None = None
@@ -101,6 +102,8 @@ class MarketState:
     admission_reason: str | None = None
     true_hard_gate_failures: list[str] = field(default_factory=list)
     signal_quality_failures: list[str] = field(default_factory=list)
+    open_position_context_status: str | None = None
+    position_invalidation_signals: list[str] = field(default_factory=list)
     entry_reference: float | None = None
     stop_reference: float | None = None
     target_reference: float | None = None
@@ -139,6 +142,7 @@ class CandidateStateStore:
         self.path = Path(path) if path is not None else None
         self.lock = RLock()
         self.states: dict[str, MarketState] = {}
+        self.portfolio = None
         if self.path is not None:
             self._load()
 
@@ -181,6 +185,18 @@ class CandidateStateStore:
             item = self.states.get(symbol.upper())
             return MarketState.from_dict(item.to_dict()) if item else None
 
+    def project_position(self, symbol, state, *, now, episode_id, reason):
+        """Only reconciliation projects canonical positions; never creates one."""
+        with self.lock:
+            item = self.states.setdefault(symbol, MarketState(symbol))
+            previous = item.state.value
+            item.state = state
+            item.episode_id = episode_id or item.episode_id
+            item.eligible_for_fast_watch = False
+            item.transition_history.append(StateTransition(now.isoformat(), previous, state.value, 'STATE_RECONCILED', reason))
+            item.last_event, item.last_reason = 'STATE_RECONCILED', reason
+            self.save()
+
     def discover(self, symbol: str, *, timestamp: datetime, event_type: str = "CANDIDATE_DISCOVERED") -> MarketState:
         symbol = symbol.upper()
         with self.lock:
@@ -219,23 +235,41 @@ class CandidateStateStore:
                 event_type="RECOVERED_OPEN_POSITION",
                 reason="LOCAL_SHADOW_STATE_RESTART",
             ))
-            self.states[symbol] = MarketState(
-                symbol=symbol, state=CandidateState.POSITION_OPEN,
-                discovery_timestamp=entry_timestamp,
-                last_event="RECOVERED_OPEN_POSITION",
-                transition_history=parsed_history,
-            )
+            if current is None:
+                self.states[symbol] = MarketState(
+                    symbol=symbol, state=CandidateState.POSITION_OPEN,
+                    discovery_timestamp=entry_timestamp,
+                    last_event="RECOVERED_OPEN_POSITION",
+                    transition_history=parsed_history,
+                )
+            else:
+                current.transition_history.append(StateTransition(
+                    timestamp=entry_timestamp,
+                    previous_state=current.state.value,
+                    new_state=CandidateState.POSITION_OPEN.value,
+                    event_type="RECOVERED_OPEN_POSITION",
+                    reason="LOCAL_SHADOW_STATE_RECONCILIATION",
+                ))
+                current.state = CandidateState.POSITION_OPEN
+                current.last_event = "RECOVERED_OPEN_POSITION"
+                current.last_reason = "LOCAL_SHADOW_STATE_RECONCILIATION"
             self.save()
             return MarketState.from_dict(self.states[symbol].to_dict())
 
     def transition(self, symbol: str, new_state: CandidateState, *, timestamp: datetime,
                    event_type: str, reason: str | None = None) -> MarketState:
         symbol = symbol.upper()
+        canonical_open = self.portfolio.has_symbol(symbol) if self.portfolio is not None else None
         with self.lock:
             if symbol not in self.states:
                 raise IllegalStateTransition(f"{symbol} has not been discovered")
             item = self.states[symbol]
             old = item.state
+            if self.portfolio is not None:
+                if canonical_open and new_state not in {CandidateState.POSITION_OPEN, CandidateState.EXIT_PENDING}:
+                    return MarketState.from_dict(item.to_dict())
+                if not canonical_open and new_state in {CandidateState.POSITION_OPEN, CandidateState.EXIT_PENDING}:
+                    return MarketState.from_dict(item.to_dict())
             if new_state == old:
                 item.last_event, item.last_reason = event_type, reason
                 return MarketState.from_dict(item.to_dict())
@@ -271,6 +305,22 @@ class CandidateStateStore:
         if not symbol or symbol not in self.states:
             return
         payload = dict(item.payload)
+        current_episode = self.states[symbol].episode_id
+        if item.episode_id and current_episode and item.episode_id != current_episode:
+            return  # A delayed old-episode event cannot mutate a new setup.
+        if self.portfolio is not None:
+            is_open = self.portfolio.has_symbol(symbol)
+            if is_open and isinstance(item, (RiskRejectedEvent, ContextExpiredEvent, TradeCandidateEvent, CandidateRemovedEvent)):
+                return
+            if isinstance(item, PositionOpenedEvent) and not is_open:
+                return
+            if isinstance(item, PositionClosedEvent) and is_open:
+                return
+            if isinstance(item, (PositionOpenedEvent, PositionClosedEvent)):
+                self.project_position(symbol, CandidateState.POSITION_OPEN if is_open else CandidateState.CLOSED,
+                                      now=item.timestamp, episode_id=item.episode_id,
+                                      reason=item.event_type.value)
+                return
         if isinstance(item, QuoteEvent):
             self.update_facts(
                 symbol, latest_quote=payload,
@@ -309,6 +359,7 @@ class CandidateStateStore:
                     "context_age_seconds", "eligible_for_fast_watch",
                     "admission_reason",
                     "true_hard_gate_failures", "signal_quality_failures",
+                    "open_position_context_status", "position_invalidation_signals",
                 )
                 if name in payload
             }

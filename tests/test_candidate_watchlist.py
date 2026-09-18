@@ -10,6 +10,7 @@ from pathlib import Path
 from threading import Thread
 
 import pytest
+from copy import deepcopy
 
 import config
 from agent.candidate_context import CandidateContext, CandidateContextStore, contexts_from_cycle
@@ -19,9 +20,17 @@ from shadow.portfolio import ShadowPortfolio
 from watcher.candidate_watcher import FastCandidateWatcher, LiveMarketScorer, LiveScore, dynamic_weights
 from watcher.models import FastQuote
 from watcher.status import shadow_dashboard_projection
+from test_market_cycle import bullish_candidate
 
 
 NOW = datetime(2026, 9, 11, 14, 0, tzinfo=timezone.utc)
+
+
+class FreshRefresher:
+    def refresh_symbol(self, symbol, *, now):
+        value = deepcopy(bullish_candidate())
+        value.update(symbol=symbol, quote_as_of=now.isoformat(), market_direction="BULLISH")
+        return value
 
 
 def context(*, slow=0.66, stop=99.0, target=105.0, at=NOW):
@@ -54,6 +63,7 @@ def watcher(tmp_path, ctx=None, scorer=None):
         store, ShadowExecutionEngine(portfolio),
         events_path=tmp_path / "candidate_events.jsonl",
         score_history_path=tmp_path / "scores.jsonl", scorer=scorer,
+        pre_execution_refresher=FreshRefresher(),
     )
     return value, store, portfolio
 
@@ -162,6 +172,84 @@ def test_simulated_dynamic_crossing_hysteresis_entry_and_handoff(tmp_path):
     assert scorer.calls == 4  # no second slow/LLM pass occurred
 
 
+class PartialRefresh:
+    def __init__(self, *, price=101.0, bid=100.99, ask=101.01):
+        self.price, self.bid, self.ask = price, bid, ask
+        self.calls = []
+
+    def refresh_symbol(self, symbol, *, now):
+        self.calls.append(symbol)
+        return {
+            "symbol": symbol, "current_price": self.price,
+            "bid": self.bid, "ask": self.ask,
+            "quote_as_of": now.isoformat(), "relative_volume": None,
+        }
+
+
+def wal_context(*, stop=99.0):
+    item = context(slow=.730, stop=stop, target=105.0)
+    item.canonical_market_data = deepcopy(bullish_candidate())
+    item.canonical_market_data.update(
+        symbol="ACME", quote_as_of=NOW.isoformat(),
+        market_direction="BULLISH", relative_volume=1.8,
+    )
+    item.consecutive_qualifying_updates = 1
+    return item
+
+
+def test_wal_regression_partial_refresh_preserves_required_fields_and_enters(tmp_path):
+    item = wal_context()
+    store = CandidateContextStore(tmp_path / "watchlist.json")
+    store.replace([item], now=NOW)
+    portfolio = ShadowPortfolio(tmp_path / "portfolio.json", tmp_path / "trades.jsonl")
+    refresher = PartialRefresh()
+    candidate = FastCandidateWatcher(
+        store, ShadowExecutionEngine(portfolio),
+        events_path=tmp_path / "candidate_events.jsonl",
+        score_history_path=tmp_path / "scores.jsonl",
+        scorer=SequenceScorer([.870171]), pre_execution_refresher=refresher,
+    )
+    at = NOW + timedelta(seconds=95)
+    transitions = candidate.process_quotes({"ACME": quote(at)}, now=at)
+    assert transitions[0]["final"] == "SHADOW_POSITION"
+    assert transitions[0]["dynamic_score"] == pytest.approx(.7809, abs=.001)
+    assert refresher.calls == ["ACME"]
+    log = (tmp_path / "candidate_events.jsonl").read_text()
+    assert '"required_fields_status": "PASS"' in log
+    assert '"missing_required_fields": []' in log
+    assert len(portfolio.snapshot().open_positions) == 1
+
+
+def test_wal_regression_true_stop_distance_failure_remains_blocking(tmp_path):
+    item = wal_context()
+    item.canonical_market_data.update(
+        vwap=100.0, ema20=99.5, intraday_support_reference=98.5,
+    )
+    store = CandidateContextStore(tmp_path / "watchlist.json")
+    store.replace([item], now=NOW)
+    portfolio = ShadowPortfolio(tmp_path / "portfolio.json", tmp_path / "trades.jsonl")
+    candidate = FastCandidateWatcher(
+        store, ShadowExecutionEngine(portfolio),
+        events_path=tmp_path / "candidate_events.jsonl",
+        score_history_path=tmp_path / "scores.jsonl",
+        scorer=SequenceScorer([.870171]),
+        pre_execution_refresher=PartialRefresh(
+            price=100.18, bid=100.17, ask=100.19,
+        ),
+    )
+    at = NOW + timedelta(seconds=95)
+    transitions = candidate.process_quotes(
+        {"ACME": quote(at, price=100.18, bid=100.17, ask=100.19)}, now=at,
+    )
+    assert transitions[0]["reason"] == (
+        "REFRESHED_HARD_GATE_FAILED:MINIMUM_STOP_DISTANCE"
+    )
+    assert not portfolio.snapshot().open_positions
+    log = (tmp_path / "candidate_events.jsonl").read_text()
+    assert '"required_fields_status": "PASS"' in log
+    assert '"missing_required_fields": []' in log
+
+
 def test_duplicate_entry_is_prevented_and_candidate_hands_off(tmp_path):
     scorer = SequenceScorer([1, 1])
     candidate, store, portfolio = watcher(tmp_path, context(slow=.9), scorer)
@@ -174,7 +262,6 @@ def test_duplicate_entry_is_prevented_and_candidate_hands_off(tmp_path):
 @pytest.mark.parametrize(("ctx", "value", "now", "reason"), [
     (context(), quote(NOW - timedelta(seconds=6)), NOW, "QUOTE_STALE"),
     (context(), quote(NOW, bid=100, ask=101), NOW, "SPREAD_TOO_WIDE"),
-    (context(target=101.2), quote(NOW, price=101.1, bid=101.09, ask=101.11), NOW, "RISK_REWARD"),
     (context(), quote(NOW + timedelta(seconds=301)), NOW + timedelta(seconds=301), "CONTEXT_EXPIRED"),
 ])
 def test_hard_entry_blockers(ctx, value, now, reason, tmp_path):

@@ -39,6 +39,7 @@ from robinhood_mcp.normalization import (
     normalized_quotes,
 )
 from robinhood_mcp.snapshot import DirectSnapshotCollector
+from robinhood_mcp.pre_execution import DirectPreExecutionMarketDataProvider
 from watcher.quote_provider import RobinhoodDirectQuoteProvider
 
 NOW = datetime(2026, 9, 10, 15, 0, tzinfo=timezone.utc)
@@ -182,6 +183,10 @@ class FakeDirectClient:
             for symbol in symbols
         ]
 
+    def get_historicals(self, symbol):
+        self.calls.append(f"history:{symbol}")
+        return ToolCall("get_equity_historicals", {"symbol": symbol}, candle_rows(symbol), .01)
+
 
 def test_direct_snapshot_generation_indicators_atomic_and_no_secrets(tmp_path):
     output = tmp_path / "state" / "market_snapshot.json"
@@ -203,6 +208,18 @@ def test_direct_snapshot_generation_indicators_atomic_and_no_secrets(tmp_path):
     serialized = output.read_text().lower()
     assert "access_token" not in serialized and "refresh_token" not in serialized
     assert not list(output.parent.glob(f".{output.name}.*"))
+
+
+def test_pre_execution_provider_fetches_only_selected_symbol(tmp_path):
+    client = FakeDirectClient()
+    row = DirectPreExecutionMarketDataProvider(
+        client, project_dir=tmp_path, market_direction="BULLISH",
+        clock=lambda: NOW,
+    ).refresh_symbol("ACME", now=NOW)
+    assert client.calls == ["history:ACME", "get_equity_quotes"]
+    assert row["symbol"] == "ACME"
+    assert row["quote_as_of"] == NOW.isoformat()
+    assert row["candles"]
 
 
 def test_one_candidate_history_failure_is_isolated(tmp_path):
@@ -302,6 +319,10 @@ def test_direct_quote_provider_keeps_source_timestamp_and_measures():
     assert quotes["ACME"].source == "DIRECT_ROBINHOOD_MCP"
     assert provider.mode == "DIRECT_MCP_UNVALIDATED"
     assert provider.metrics["request_count"] == 1
+    assert provider.metrics["median_latency_seconds"] is not None
+    assert provider.metrics["p95_latency_seconds"] is not None
+    assert provider.metrics["median_quote_age_seconds"] == 0
+    assert provider.metrics["p95_quote_age_seconds"] == 0
     assert provider.metrics["suitable_for_configured_fast_watcher"] is False
 
 

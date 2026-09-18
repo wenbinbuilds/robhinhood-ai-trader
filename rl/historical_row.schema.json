@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Offline RL historical observation row",
+  "type": "object",
+  "required": ["timestamp", "symbol"],
+  "properties": {
+    "timestamp": {"type": "string", "format": "date-time"},
+    "quote_timestamp": {"type": "string", "format": "date-time"},
+    "session_date": {"type": "string", "format": "date"},
+    "symbol": {"type": "string"},
+    "episode_id": {"type": "string"},
+    "price": {"type": "number"},
+    "bid": {"type": "number"},
+    "ask": {"type": "number"},
+    "quote_status": {"enum": ["FRESH", "STALE", "UNAVAILABLE", "INVALID"]},
+    "candles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["begins_at", "open", "high", "low", "close", "volume"],
+        "properties": {
+          "begins_at": {"type": "string", "format": "date-time"},
+          "open": {"type": "number"}, "high": {"type": "number"},
+          "low": {"type": "number"}, "close": {"type": "number"},
+          "volume": {"type": "number", "minimum": 0},
+          "is_forming": {"type": "boolean"}, "interpolated": {"type": "boolean"}
+        }
+      }
+    },
+    "outcome_status": {"enum": ["OBSERVED", "SIMULATED", "UNAVAILABLE"]},
+    "exit_price": {"type": "number"}, "outcome_bid": {"type": "number"},
+    "mfe_r": {"type": "number"}, "mae_r": {"type": "number"},
+    "holding_seconds": {"type": "number", "minimum": 0},
+    "terminal_reason": {"type": "string"}
+  },
+  "additionalProperties": true
+}

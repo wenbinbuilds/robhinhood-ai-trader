@@ -171,6 +171,13 @@ def live_inputs(**updates: Any) -> LiveExecutionInputs:
         "daily_realized_pnl": 0.0,
         "trading_date": "2026-09-10",
         "confirmation_token": "human-token",
+        "pre_execution_refresh": {
+            "event": "PRE_EXECUTION_REFRESH",
+            "status": "APPROVED",
+            "symbol": "ACME",
+            "timestamp": NOW.isoformat(),
+            "refreshed_quote_age_seconds": 0.0,
+        },
     }
     values.update(updates)
     return LiveExecutionInputs(**values)

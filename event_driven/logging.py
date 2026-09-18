@@ -13,6 +13,8 @@ class StructuredEventLogger:
     def __init__(self, path: str | Path, state_store: CandidateStateStore | None = None) -> None:
         self.path = Path(path)
         self.state_store = state_store
+        from trading_runtime.journal import EventJournal
+        self.journal = EventJournal(self.path.with_suffix('.journal.jsonl'))
 
     def __call__(self, item: MarketEvent) -> None:
         # Raw 2-second quotes are intentionally omitted. Alpha is logged only
@@ -20,7 +22,9 @@ class StructuredEventLogger:
         if isinstance(item, QuoteEvent):
             return
         payload = dict(item.payload)
-        state = self.state_store.get(item.symbol) if self.state_store and item.symbol else None
+        # Historical facts must never be filled from a newer mutable projection.
+        state = None
+        self.journal.append_market_event(item)
         append_event(
             self.path,
             item.event_type.value,
@@ -28,6 +32,8 @@ class StructuredEventLogger:
             symbol=item.symbol,
             event_id=item.event_id,
             cycle_id=item.cycle_id,
+            episode_id=item.episode_id,
+            payload=payload,
             previous_state=payload.get("previous_state"),
             new_state=(payload.get("new_state") or (state.state.value if state else None)),
             slow_score=payload.get("slow_alpha_score", state.slow_alpha_score if state else None),
@@ -52,7 +58,7 @@ def concise_event_line(item: MarketEvent) -> str | None:
     if isinstance(item, QuoteEvent):
         return None
     stamp = item.timestamp.strftime("%H:%M:%S")
-    symbol = f" {item.symbol}" if item.symbol else ""
+    symbol = f" {item.symbol} episode={item.episode_id or 'unassigned'}" if item.symbol else ""
     payload = dict(item.payload)
     if isinstance(item, AlphaUpdatedEvent):
         transition = ""
@@ -61,6 +67,13 @@ def concise_event_line(item: MarketEvent) -> str | None:
                 f" {payload.get('previous_state')} → {payload.get('new_state')}"
             )
         if item.source == "SLOW_ALPHA":
+            if payload.get("context_action") == "POSITION_CONTEXT_UPDATED":
+                return (
+                    f"[{stamp}]{symbol} slow context refreshed "
+                    f"state={payload.get('new_state')} "
+                    f"technical_status={payload.get('open_position_context_status')} "
+                    "action=POSITION_CONTEXT_UPDATED"
+                )
             return (
                 f"[{stamp}]{symbol}{transition} slow={payload.get('slow_alpha_score')} "
                 f"context_ttl={payload.get('context_ttl_seconds')}s "

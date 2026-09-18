@@ -217,8 +217,8 @@ def test_position_carried_past_entry_date_exits_at_first_fresh_mark(tmp_path: Pa
     evaluated, exited, _ = engine.monitor_positions(
         lambda _: quote(102, as_of=next_session), now=next_session
     )
-    assert evaluated[0]["status"] == "END_OF_DAY_EXIT"
-    assert exited[0]["exit_reason"] == "END_OF_DAY_EXIT"
+    assert evaluated[0]["status"] == "MISSED_EOD_RECOVERY_EXIT"
+    assert exited[0]["exit_reason"] == "MISSED_EOD_RECOVERY_EXIT"
     assert not portfolio.state.open_positions
 
 

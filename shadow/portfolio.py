@@ -39,6 +39,33 @@ class ShadowPortfolio:
         self.trades_path = Path(trades_path)
         self._initialize_trade_history()
         self.state = self._load()
+        from trading_runtime.journal import EventJournal
+        self.journal = EventJournal(self.state_path.with_suffix('.events.jsonl'))
+        self.recover_audit()
+
+    def recover_audit(self):
+        """Canonical records are an outbox; mirror missing facts, never execute."""
+        from trading_runtime.journal import RuntimeEvent, RuntimeEventType
+        for position in self.state.open_positions:
+            self.journal.append(RuntimeEvent(
+                RuntimeEventType.SHADOW_POSITION_OPENED, position.entry_timestamp,
+                position.symbol, position.episode_id, position.research_cycle_id,
+                position.to_dict(), event_id=position.entry_intent_id))
+        for trade in self.state.closed_positions:
+            payload = trade.to_dict()
+            payload.update(position_id=trade.trade_id, entry_time=trade.entry_timestamp,
+                           exit_time=trade.exit_timestamp, stop_at_exit=trade.stop,
+                           target_at_exit=trade.target, realized_pnl=trade.net_pnl,
+                           holding_seconds=trade.holding_time_minutes * 60)
+            self.journal.append(RuntimeEvent(
+                RuntimeEventType.POSITION_CLOSED, trade.exit_timestamp,
+                trade.symbol, trade.episode_id, trade.research_cycle_id,
+                payload, event_id=trade.exit_intent_id))
+            if trade.exit_reason in RuntimeEventType._value2member_map_:
+                self.journal.append(RuntimeEvent(RuntimeEventType(trade.exit_reason),
+                    trade.exit_timestamp, trade.symbol, trade.episode_id, trade.research_cycle_id,
+                    payload, event_id='reason:' + trade.exit_intent_id))
+            self._append_trade(trade)
 
     def _initialize_trade_history(self) -> None:
         """Create the append-only trade log without truncating existing data."""
@@ -138,23 +165,38 @@ class ShadowPortfolio:
     def add_position(self, position: ShadowPosition) -> None:
         if self.has_symbol(position.symbol):
             raise ValueError("DUPLICATE_POSITION")
+        if any(p.episode_id == position.episode_id for p in self.state.open_positions + self.state.closed_positions):
+            raise ValueError('EPISODE_ALREADY_EXECUTED')
+        previous = deepcopy(self.state)
         self.state.open_positions.append(position)
         self.state.cash = round(self.state.cash - position.notional_value, 4)
         self.state.trades_today += 1
         self.revalue()
+        try:
+            self.save()
+        except Exception:
+            self.state = previous
+            raise
+        self.recover_audit()
 
     @synchronized
     def close_position(self, trade_id: str, trade: ShadowTrade) -> None:
         position = next((item for item in self.state.open_positions if item.trade_id == trade_id), None)
         if position is None:
             return  # Idempotent second exit; never credit cash twice.
+        previous = deepcopy(self.state)
         self.state.open_positions.remove(position)
         self.state.closed_positions.append(trade)
         self.state.cash = round(self.state.cash + trade.exit_price * trade.quantity, 4)
         self.state.realized_pnl = round(self.state.realized_pnl + trade.net_pnl, 4)
         self.state.daily_pnl = round(self.state.daily_pnl + trade.net_pnl, 4)
         self.revalue()
-        self._append_trade(trade)
+        try:
+            self.save()
+        except Exception:
+            self.state = previous
+            raise
+        self.recover_audit()
 
     @synchronized
     def revalue(self, marks: Mapping[str, float] | None = None) -> None:
@@ -198,5 +240,11 @@ class ShadowPortfolio:
 
     def _append_trade(self, trade: ShadowTrade) -> None:
         self.trades_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.trades_path.exists():
+            with self.trades_path.open() as existing:
+                if any(json.loads(line).get('trade_id') == trade.trade_id for line in existing if line.strip()):
+                    return
         with self.trades_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(trade.to_dict(), sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())

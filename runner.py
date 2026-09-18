@@ -31,9 +31,11 @@ from robinhood_mcp import (
 )
 from robinhood_mcp.normalization import normalized_account, normalized_quotes
 from robinhood_mcp.snapshot import DirectSnapshotCollector
+from robinhood_mcp.pre_execution import DirectPreExecutionMarketDataProvider
 from robinhood_mcp.client import ALLOWED_TOOLS
 from agent.llm_reasoning_bridge import LlmReasoningBridge
 from shadow.performance import ShadowPerformance
+from shadow.session_audit import ShadowSessionAudit
 from shadow.portfolio import ShadowPortfolio
 from shadow.execution import ShadowExecutionEngine
 from execution.shadow_executor import ShadowExecutor
@@ -52,6 +54,39 @@ PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_SNAPSHOT = PROJECT_DIR / "state" / "market_snapshot.json"
 SHADOW_STATE = PROJECT_DIR / "state" / "shadow_portfolio.json"
 SHADOW_TRADES = PROJECT_DIR / "state" / "shadow_trades.jsonl"
+
+
+def load_rl_shadow_runtime():
+    if config.RL_MODE not in {'OFFLINE', 'SHADOW_COMPARE', 'SHADOW_CONTROL'}:
+        raise RuntimeError('unsupported RL_MODE; LIVE is never valid')
+    if not config.RL_ENABLED or config.RL_MODE not in {'SHADOW_COMPARE', 'SHADOW_CONTROL'}:
+        return None
+    if not config.RL_MODEL_ID:
+        raise RuntimeError('RL_MODEL_ID must be explicitly selected for shadow inference')
+    from rl.training import load_model
+    from rl.shadow_compare import RuntimeShadowCompare, ShadowComparator
+    policy, normalizer, metadata = load_model(
+        PROJECT_DIR / config.RL_MODEL_REGISTRY_PATH, config.RL_MODEL_ID)
+    if metadata.registry_state not in {'SHADOW_COMPARE', 'SHADOW_APPROVED'}:
+        raise RuntimeError('model registry state does not permit shadow inference')
+    if config.RL_MODE == 'SHADOW_CONTROL' and metadata.registry_state != 'SHADOW_APPROVED':
+        raise RuntimeError('SHADOW_CONTROL requires explicit SHADOW_APPROVED promotion')
+    return RuntimeShadowCompare(policy, normalizer,
+        ShadowComparator(PROJECT_DIR / config.RL_SHADOW_COMPARE_PATH))
+
+
+def load_scalp_runtime(portfolio, context_store, snapshot_path):
+    if not config.SCALP_ENABLED:
+        return None
+    if config.SCALP_MODE != 'SHADOW' or config.MODE != 'SHADOW_TRADING':
+        raise RuntimeError('scalp runtime is SHADOW_TRADING only')
+    from strategies.scalp.runtime import ScalpRuntime
+    from strategies.scalp.market_data import ScalpMarketDataCache
+    cache = ScalpMarketDataCache(snapshot_path, context_store)
+    return ScalpRuntime(
+        portfolio, cache.get, universe=cache.symbols,
+        setup_path=PROJECT_DIR/config.SCALP_STATE_PATH,
+        events_path=PROJECT_DIR/config.SCALP_EVENT_LOG_PATH)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -87,22 +122,152 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="verify direct MCP tools, Agentic account, and one read-only quote",
     )
+    mode.add_argument("--rl-build-dataset", action="store_true", help="build an offline chronological RL dataset")
+    mode.add_argument("--rl-train", action="store_true", help="train one offline PPO model")
+    mode.add_argument("--rl-evaluate", action="store_true", help="evaluate a selected PPO model on unseen data")
+    mode.add_argument("--rl-shadow-compare", action="store_true", help="write hypothetical PPO/baseline comparisons only")
+    mode.add_argument("--rl-status", action="store_true", help="show local RL configuration and model registry")
+    mode.add_argument("--scalp-status", action="store_true", help="show local scalp configuration and state")
+    mode.add_argument("--scalp-summary", action="store_true", help="show strategy-attributed local scalp performance")
+    mode.add_argument("--scalp-backtest", action="store_true", help="run chronological local scalp simulation")
     parser.add_argument(
         "--snapshot",
         type=Path,
         default=DEFAULT_SNAPSHOT,
         help=f"normalized read-only data file (default: {DEFAULT_SNAPSHOT})",
     )
+    parser.add_argument("--rl-input", type=Path, help="historical JSON or JSONL input for dataset building")
+    parser.add_argument("--rl-dataset", type=Path, default=PROJECT_DIR / config.RL_DATASET_PATH)
+    parser.add_argument("--rl-model-id", default=None, help="explicit immutable model ID")
+    parser.add_argument("--rl-timesteps", type=int, default=10_000)
+    parser.add_argument("--scalp-input", type=Path, help="historical JSON/JSONL rows for scalp backtest")
     return parser.parse_args(argv)
+
+
+def _scalp_command(args) -> int:
+    from strategies.scalp.analytics import scalp_summary, friction_sensitivity, strategy_attribution
+    if args.scalp_status:
+        payload = {'enabled': config.SCALP_ENABLED, 'mode': config.SCALP_MODE,
+                   'strategy_id': config.SCALP_STRATEGY_ID,
+                   'max_quote_age_seconds': config.SCALP_MAX_QUOTE_AGE_SECONDS,
+                   'max_spread_pct': config.SCALP_MAX_SPREAD_PCT,
+                   'min_net_edge_pct': config.SCALP_MIN_EXPECTED_NET_EDGE,
+                   'max_hold_seconds': config.SCALP_MAX_HOLD_SECONDS,
+                   'live_supported': False}
+        print(json.dumps(payload, indent=2, sort_keys=True)); return 0
+    try: portfolio = ShadowPortfolio(SHADOW_STATE, SHADOW_TRADES)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f'SCALP STATE ERROR: {type(exc).__name__}: {exc}', file=sys.stderr); return 2
+    if args.scalp_summary:
+        state = portfolio.snapshot()
+        print(json.dumps({'performance': scalp_summary(state.closed_positions),
+                          'attribution': strategy_attribution(portfolio)}, indent=2, sort_keys=True))
+        return 0
+    if args.scalp_backtest:
+        if args.scalp_input is None:
+            print('--scalp-input is required for backtest', file=sys.stderr); return 2
+        try:
+            if args.scalp_input.suffix == '.jsonl':
+                with args.scalp_input.open() as handle:
+                    rows = [json.loads(line) for line in handle if line.strip()]
+            else:
+                value = json.loads(args.scalp_input.read_text())
+                rows = value if isinstance(value, list) else value.get('rows', [])
+            from strategies.scalp.simulation import ScalpBacktester
+            trades = ScalpBacktester().run(rows)
+            print(json.dumps({'strategy_id': 'SCALP', 'trades': len(trades),
+                              'performance': scalp_summary(trades),
+                              'friction_sensitivity': friction_sensitivity(trades),
+                              'claim': 'SIMULATED_NOT_EVIDENCE_OF_PROFITABILITY'},
+                             indent=2, sort_keys=True, allow_nan=False))
+            return 0
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            print(f'SCALP BACKTEST FAILED: {type(exc).__name__}: {exc}', file=sys.stderr); return 2
+    return 2
+
+
+def _rl_command(args) -> int:
+    """Local offline commands have no Robinhood client or execution adapter."""
+    from rl.dataset import HistoricalDatasetBuilder, chronological_split
+    from rl.registry import ModelRegistry
+    registry = ModelRegistry(PROJECT_DIR / config.RL_MODEL_REGISTRY_PATH)
+    if args.rl_status:
+        print(json.dumps({'enabled': config.RL_ENABLED, 'mode': config.RL_MODE,
+                          'selected_model': config.RL_MODEL_ID, 'models': registry.status(),
+                          'live_supported': False}, indent=2, sort_keys=True))
+        return 0
+    if args.rl_build_dataset:
+        if args.rl_input is None:
+            print('--rl-input is required for dataset building', file=sys.stderr); return 2
+        try:
+            if args.rl_input.suffix == '.jsonl':
+                with args.rl_input.open() as handle:
+                    rows = [json.loads(line) for line in handle if line.strip()]
+            else:
+                value = json.loads(args.rl_input.read_text())
+                rows = value if isinstance(value, list) else value.get('rows', [])
+            result = HistoricalDatasetBuilder().write(HistoricalDatasetBuilder().build(rows), args.rl_dataset)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            print(f'RL DATASET BUILD FAILED: {type(exc).__name__}: {exc}', file=sys.stderr); return 2
+        print(json.dumps(result, indent=2, sort_keys=True)); return 0
+    if args.rl_train:
+        from rl.training import train_ppo
+        try: result = train_ppo(args.rl_dataset, registry.root, timesteps=args.rl_timesteps)
+        except Exception as exc:
+            print(f'RL TRAINING FAILED: {type(exc).__name__}: {exc}', file=sys.stderr); return 2
+        print(json.dumps(result, indent=2, sort_keys=True)); return 0
+    model_id = args.rl_model_id or config.RL_MODEL_ID
+    if not model_id:
+        print('--rl-model-id is required; models are never selected automatically', file=sys.stderr); return 2
+    from rl.training import evaluate_model, load_model
+    if args.rl_evaluate:
+        try: result = evaluate_model(args.rl_dataset, registry.root, model_id, split='test')
+        except Exception as exc:
+            print(f'RL EVALUATION FAILED: {type(exc).__name__}: {exc}', file=sys.stderr); return 2
+        print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False)); return 0
+    if args.rl_shadow_compare:
+        from rl.evaluation import evaluate_policy, comparison
+        from rl.policy import BaselinePolicy
+        from rl.shadow_compare import ShadowComparator
+        try:
+            steps = HistoricalDatasetBuilder.read(args.rl_dataset)
+            _, _, test = chronological_split(steps)
+            policy, normalizer, _ = load_model(registry.root, model_id)
+            _, baseline = evaluate_policy(test, BaselinePolicy())
+            _, learned = evaluate_policy(test, policy, normalizer=normalizer)
+            compared = comparison(baseline, learned)
+            writer = ShadowComparator(PROJECT_DIR / config.RL_SHADOW_COMPARE_PATH)
+            for row in compared['rows']:
+                writer.record(timestamp=row['timestamp'], symbol=row['symbol'], episode_id=row['episode_id'],
+                              baseline_action=row['baseline_action'], rl_action=row['rl_action'],
+                              outcome_status=row['outcome_status'], outcome={'r': row['r']})
+            print(json.dumps({'mode': 'SHADOW_COMPARE', 'portfolio_mutations': 0,
+                              'decisions': compared['decisions'], 'disagreements': compared['disagreements']}, indent=2))
+            return 0
+        except Exception as exc:
+            print(f'RL SHADOW COMPARE FAILED: {type(exc).__name__}: {exc}', file=sys.stderr); return 2
+    return 2
 
 
 def load_provider(path: Path) -> JsonSnapshotProvider:
     return JsonSnapshotProvider.from_path(path)
 
 
+def print_cycle_diagnostics(result: Mapping[str, object]) -> None:
+    """Best-effort observability that is isolated from cycle execution."""
+
+    try:
+        for line in cycle_diagnostic_lines(result):
+            print(line)
+    except Exception as exc:
+        print(
+            f"DIAGNOSTICS STATUS: DEGRADED ({type(exc).__name__}; cycle continued)"
+        )
+
+
 def run_analysis(
     snapshot: Path, shadow_portfolio: ShadowPortfolio | None = None,
-    *, reasoning_provider=None,
+    *, reasoning_provider=None, pre_execution_refresher=None,
 ) -> dict[str, object]:
     provider = load_provider(snapshot)
     return MarketCycle(
@@ -110,6 +275,7 @@ def run_analysis(
         state_path=PROJECT_DIR / "state" / "session.json",
         logs_dir=PROJECT_DIR / "logs",
         shadow_portfolio=shadow_portfolio,
+        pre_execution_refresher=pre_execution_refresher,
         reasoning_bridge=(reasoning_provider or LlmReasoningBridge(project_dir=PROJECT_DIR)),
     ).run()
 
@@ -155,6 +321,9 @@ def refresh_and_run(
         print("BRIDGE STATUS: INVALID_SHADOW_STATE")
         print(f"ANALYSIS STATUS: NOT_RUN ({detail})")
         return 3, None
+    if event_orchestrator is not None and shadow_portfolio is not None:
+        event_orchestrator.attach_shadow_portfolio(shadow_portfolio)
+        event_orchestrator.reconcile_position_state(now=cycle_started_at)
     shadow_symbols = (
         [position.symbol for position in shadow_portfolio.snapshot().open_positions]
         if shadow_portfolio is not None
@@ -233,6 +402,12 @@ def refresh_and_run(
                 result = run_analysis(
                     snapshot, shadow_portfolio,
                     reasoning_provider=reasoning_provider,
+                    pre_execution_refresher=(
+                        DirectPreExecutionMarketDataProvider(
+                            direct_client, project_dir=PROJECT_DIR
+                        )
+                        if direct_client is not None else None
+                    ),
                 )
             except SnapshotValidationError as exc:
                 _log_refresh_failure(
@@ -270,7 +445,13 @@ def refresh_and_run(
         return 3, None
 
     total = time.monotonic() - cycle_start
-    reasoning = result.get("llm_reasoning", {}).get("trace", {}).get("reasoning_duration_seconds", 0)
+    reasoning_root = result.get("llm_reasoning")
+    reasoning_trace_for_timing = (
+        reasoning_root.get("trace") if isinstance(reasoning_root, Mapping) else {}
+    )
+    if not isinstance(reasoning_trace_for_timing, Mapping):
+        reasoning_trace_for_timing = {}
+    reasoning = reasoning_trace_for_timing.get("reasoning_duration_seconds", 0)
     timing = dict(cycle_started_at=cycle_started_at.isoformat(), snapshot_started_at=snapshot_started_at.isoformat(),
                   snapshot_completed_at=snapshot_completed_at.isoformat(), analysis_started_at=analysis_started_at.isoformat(),
                   candidate_quotes=[{"symbol": r.get("symbol"), "quote_as_of": r.get("quote_as_of"),
@@ -288,13 +469,12 @@ def refresh_and_run(
             [position.symbol for position in shadow_portfolio.snapshot().open_positions]
             if shadow_portfolio is not None else []
         )
-        reasoning_trace = result.get("llm_reasoning", {}).get("trace", {})
         context_store.replace(
             contexts, now=analysis_started_at, exclude_symbols=open_symbols,
-            preserve_research=(
-                isinstance(reasoning_trace, Mapping)
-                and reasoning_trace.get("status") == "CACHED"
-            ),
+            # Technical context gets a fresh 300-second watch TTL even when
+            # qualitative research is reused. Its original generation time is
+            # persisted separately on CandidateContext.
+            preserve_research=False,
         )
         if event_orchestrator is not None:
             event_orchestrator.ingest_slow_cycle(
@@ -327,8 +507,7 @@ def refresh_and_run(
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps({"event": "SLOW_CYCLE_TIMING", "mode": config.MODE, **timing}) + "\n")
     print(f"ANALYSIS STATUS: {result['decision']['type']}")
-    for line in cycle_diagnostic_lines(result):
-        print(line)
+    print_cycle_diagnostics(result)
     if config.MODE == "SHADOW_TRADING":
         summary = result.get("shadow_portfolio")
         if isinstance(summary, Mapping):
@@ -435,6 +614,71 @@ def print_shadow_summary() -> int:
             f"  {trade.symbol} {trade.exit_reason} net={trade.net_pnl:.2f} "
             f"held={trade.holding_time_minutes:.1f}m"
         )
+    audit = ShadowSessionAudit(PROJECT_DIR).summarize()
+    counts = audit["funnel"]["counts"]
+    geometry = audit['entry_geometry']
+    print('ENTRY GEOMETRY: ' + json.dumps({
+        key: geometry[key] for key in (
+            'attempts_with_geometry_evidence', 'RR_AT_RESEARCH', 'RR_AT_ENTRY',
+            'RR_DEGRADATION', 'rr_failures_crossing_boundary_due_to_entry_drift',
+            'refreshed_geometry_restored_valid_rr', 'correctly_rejected_extended',
+            'historical_entry_drift_boundary_crossings',
+        )
+    }, sort_keys=True))
+    print(f"SHADOW SESSION {audit['session_date']}")
+    session_labels = (
+        ("Candidates scanned", "scanner_candidates"),
+        ("Unique candidates", "unique_symbols_discovered"),
+        ("Slow analyses", "slow_analyses_completed"),
+        ("True-hard rejected", "true_hard_rejected"),
+        ("Below slow 0.60", "slow_score_below_0.60"),
+        ("Fast watch admitted", "fast_watch_admitted"),
+        ("Reached dynamic 0.70", "dynamic_reached_0.70"),
+        ("Reached dynamic 0.72", "dynamic_reached_0.72"),
+        ("Confirmed crossings", "confirmed_threshold_crossings"),
+        ("Pre-execution attempts", "pre_execution_attempts"),
+        ("Pre-execution passed", "pre_execution_passed"),
+        ("Risk approvals", "risk_approvals"),
+        ("Entries", "shadow_entries"),
+        ("Exits", "shadow_exits"),
+    )
+    for label, key in session_labels:
+        print(f"{label}: {counts.get(key, 0)}")
+    print("Primary lost-opportunity reasons:")
+    rejected = audit.get("rejections", {})
+    reason_counts: dict[str, int] = {}
+    for category in (
+        "TERMINAL_HARD_REJECTION", "SCORE_BELOW_THRESHOLD",
+        "TEMPORARY_BLOCK", "INFRASTRUCTURE_FAILURE",
+    ):
+        for reason, count in rejected.get(category, {}).get("reasons", {}).items():
+            reason_counts[reason] = reason_counts.get(reason, 0) + int(count)
+    for reason, count in sorted(reason_counts.items(), key=lambda item: (-item[1], item[0]))[:5]:
+        print(f"  {reason}: {count}")
+    quote_rate = audit.get("quote_reliability", {}).get("success_rate_percent")
+    cache_rate = audit.get("llm_cache", {}).get("hit_rate_percent")
+    print(f"Quote success rate: {'UNAVAILABLE' if quote_rate is None else str(quote_rate) + '%'}")
+    print(f"LLM cache hit rate: {'UNAVAILABLE' if cache_rate is None else str(cache_rate) + '%'}")
+    frequency = audit.get("frequency", {})
+    print(
+        "Observed frequency: "
+        f"candidates/hour={frequency.get('scanner_candidates_per_hour')} "
+        f"fast-watch/hour={frequency.get('fast_watch_admissions_per_hour')} "
+        f"trade-candidates/hour={frequency.get('trade_candidates_per_hour')} "
+        f"entries/hour={frequency.get('shadow_entries_per_hour')}"
+    )
+    print("OFFLINE COUNTERFACTUALS (runtime settings unchanged)")
+    for item in audit.get("counterfactuals", []):
+        print(
+            f"  watch={item['watch_threshold']:.2f} trade={item['trade_threshold']:.2f} "
+            f"additional_watch={item['additional_watch_opportunities']} "
+            f"additional_trade_candidates={item['additional_trade_candidates_observed']} "
+            "hypothetical_pnl=UNAVAILABLE"
+        )
+    if audit.get("warnings"):
+        print("Audit warnings:")
+        for warning in audit["warnings"]:
+            print(f"  {warning}")
     return 0
 
 
@@ -496,6 +740,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     args = parse_args(argv)
+    if any((args.rl_build_dataset, args.rl_train, args.rl_evaluate,
+            args.rl_shadow_compare, args.rl_status)):
+        return _rl_command(args)
+    if any((args.scalp_status, args.scalp_summary, args.scalp_backtest)):
+        return _scalp_command(args)
     if args.robinhood_auth:
         return robinhood_auth()
     if args.robinhood_mcp_check:
@@ -583,8 +832,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ) if portfolio is not None else None
             )
             if event_orchestrator is not None and portfolio is not None:
-                event_orchestrator.recover_open_positions(
-                    portfolio.snapshot().open_positions
+                event_orchestrator.attach_shadow_portfolio(portfolio)
+                event_orchestrator.reconcile_position_state(
+                    now=datetime.now(timezone.utc)
                 )
             reasoning_provider = EventDrivenReasoningProvider(
                 LlmReasoningBridge(project_dir=PROJECT_DIR)
@@ -604,6 +854,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                                     events_path=PROJECT_DIR / "logs" / "fast_candidate_watcher.jsonl",
                                     score_history_path=PROJECT_DIR / config.CANDIDATE_SCORE_HISTORY_PATH,
                                     event_orchestrator=event_orchestrator,
+                                    pre_execution_refresher=DirectPreExecutionMarketDataProvider(
+                                        client, project_dir=PROJECT_DIR
+                                    ),
+                                    rl_shadow_runtime=load_rl_shadow_runtime(),
                                 )
                                 if context_store is not None else None
                             )
@@ -613,6 +867,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 events_path=PROJECT_DIR / "logs" / "fast_watcher.jsonl",
                                 candidate_watcher=candidate_watcher,
                                 event_orchestrator=event_orchestrator,
+                                scalp_runtime=load_scalp_runtime(portfolio, context_store, snapshot),
                             )
                             print("FAST QUOTE MODE: DIRECT_ROBINHOOD_MCP (performance not yet validated as REALTIME_FAST)")
                         if event_orchestrator is not None:
@@ -646,6 +901,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         events_path=PROJECT_DIR / "logs" / "fast_candidate_watcher.jsonl",
                         score_history_path=PROJECT_DIR / config.CANDIDATE_SCORE_HISTORY_PATH,
                         event_orchestrator=event_orchestrator,
+                        rl_shadow_runtime=load_rl_shadow_runtime(),
                     )
                     if context_store is not None else None
                 )
@@ -655,6 +911,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     events_path=PROJECT_DIR / "logs" / "fast_watcher.jsonl",
                     candidate_watcher=candidate_watcher,
                     event_orchestrator=event_orchestrator,
+                    scalp_runtime=load_scalp_runtime(portfolio, context_store, snapshot),
                 )
                 print("FAST QUOTE MODE: DEGRADED_SNAPSHOT (legacy provider)")
             if event_orchestrator is not None:

@@ -152,7 +152,7 @@ def test_valid_structured_response_and_one_call_for_multiple_candidates(
     command = next(call for call in runner.calls if call[1] == "exec")
     assert "--output-schema" in command
     assert "--search" not in command
-    assert 'web_search="live"' in command
+    assert f'web_search="{config.CODEX_REASONING_WEB_SEARCH}"' in command
     assert f'model_reasoning_effort="{config.CODEX_REASONING_EFFORT}"' in command
     assert "read-only" in command
     assert "mcp_servers.robinhood-trading.enabled=false" in command
@@ -162,6 +162,25 @@ def test_valid_structured_response_and_one_call_for_multiple_candidates(
         assert "--model" not in command
     assert result.trace.prompt_version == "v1"
     assert result.trace.token_usage is None
+    profile = result.trace.diagnostics["profile"]
+    assert profile["model"] == config.CODEX_REASONING_MODEL
+    assert profile["reasoning_effort"] == "low"
+    assert profile["input_chars"] > 0
+    assert profile["input_tokens_estimate"] > 0
+    assert profile["startup_ms"] >= 0
+    assert profile["inference_ms"] >= 0
+    assert profile["parse_ms"] >= 0
+    assert profile["total_ms"] >= 0
+    assert profile["output_tokens_estimate"] > 0
+
+
+def test_model_catalog_preflight_is_cached_per_bridge(tmp_path: Path) -> None:
+    runner = FakeRunner(response())
+    value = bridge(tmp_path, runner)
+    value.reason(payload(), expected_symbols=("ACME",), now=NOW)
+    value.reason(payload(), expected_symbols=("ACME",), now=NOW)
+    assert len([call for call in runner.calls if call[1:3] == ["debug", "models"]]) == 1
+    assert len([call for call in runner.calls if call[1] == "exec"]) == 2
 
 
 @pytest.mark.parametrize(
@@ -187,6 +206,7 @@ def test_timeout_fails_closed(tmp_path: Path) -> None:
         payload(), expected_symbols=("ACME",), now=NOW
     )
     assert result.failure_reason == "LLM_REASONING_TIMEOUT"
+    assert result.trace.status == "TIMEOUT"
 
 
 def test_missing_candidate_is_rejected(tmp_path: Path) -> None:

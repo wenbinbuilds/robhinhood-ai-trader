@@ -13,11 +13,11 @@ from watcher.quote_provider import FastQuoteProvider
 from watcher.storage import atomic_json, event
 
 
-class FastPositionWatcher:
+class PositionController:
     def __init__(self, portfolio: ShadowPortfolio, provider: FastQuoteProvider,
                  executor: ShadowExecutor, *, status_path: Path, events_path: Path,
                  clock=None, interval=None, candidate_watcher=None,
-                 event_orchestrator=None):
+                 event_orchestrator=None, scalp_runtime=None):
         if config.MODE != "SHADOW_TRADING":
             raise ValueError("watcher is local SHADOW_TRADING only")
         self.portfolio, self.provider, self.executor = portfolio, provider, executor
@@ -27,6 +27,7 @@ class FastPositionWatcher:
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.candidate_watcher = candidate_watcher
         self.event_orchestrator = event_orchestrator
+        self.scalp_runtime = scalp_runtime
         if (candidate_watcher is not None and event_orchestrator is not None
                 and candidate_watcher.state_store is not event_orchestrator.state_store):
             raise ValueError("fast watcher diagnostics must share CandidateStateStore")
@@ -89,12 +90,14 @@ class FastPositionWatcher:
             self.candidate_watcher.symbols(self.clock())
             if self.candidate_watcher is not None else []
         )
-        requested_symbols = list(dict.fromkeys(all_symbols + candidate_symbols))
+        scalp_symbols = self.scalp_runtime.symbols(self.clock()) if self.scalp_runtime is not None else []
+        requested_symbols = list(dict.fromkeys(all_symbols + candidate_symbols + scalp_symbols))
         symbols = requested_symbols[:config.FAST_WATCH_MAX_SYMBOLS]
         self.status["open_symbols"] = all_symbols
         self.status["watched_symbols"] = symbols
         self.status["position_symbols"] = all_symbols
         self.status["candidate_symbols"] = candidate_symbols
+        self.status["scalp_symbols"] = scalp_symbols
         self.status["unmonitored_symbols"] = requested_symbols[len(symbols):]
         quotes = {}
         failed = False
@@ -115,13 +118,11 @@ class FastPositionWatcher:
         fresh = {}
         for symbol in symbols:
             quote = quotes.get(symbol)
-            try:
-                age = quote.age_at(now) if isinstance(quote, FastQuote) else None
-                valid = (quote.symbol == symbol and quote.timestamp.tzinfo is not None
-                         and age is not None and 0 <= age <= config.FAST_QUOTE_MAX_AGE_SECONDS
-                         and quote.mark_price is not None and bool(quote.source))
-            except (AttributeError, TypeError, ValueError):
-                age, valid = None, False
+            from trading_runtime.contracts import MarketSnapshot, Quality
+            snapshot = MarketSnapshot.from_quote(quote, symbol=symbol, now=now,
+                                                 max_age=config.FAST_QUOTE_MAX_AGE_SECONDS)
+            age = snapshot.quote_age
+            valid = snapshot.quote_status == Quality.FRESH and bool(snapshot.provider)
             if age is not None and age >= 0:
                 self._age_total += age
                 self._age_count += 1
@@ -150,6 +151,17 @@ class FastPositionWatcher:
             else:
                 self.candidate_watcher.process_quotes(fresh, now=now)
 
+        if self.scalp_runtime is not None:
+            scalp_result = self.scalp_runtime.on_quotes(fresh, now=now)
+            if self.event_orchestrator is not None:
+                for trade in scalp_result['exits']:
+                    self.event_orchestrator.position_closed(
+                        trade.symbol, now=now, reason=trade.exit_reason)
+                for detail in scalp_result['entries']:
+                    if detail.get('status') == 'OPENED':
+                        self.event_orchestrator.position_opened(
+                            detail['symbol'], now=now, trade_id=detail['trade_id'])
+
         if self.event_orchestrator is not None:
             for symbol in all_symbols:
                 quote = fresh.get(symbol)
@@ -162,6 +174,8 @@ class FastPositionWatcher:
         closed_events = []
         with self.portfolio.lock:
             for position in self.portfolio.state.open_positions:
+                if position.strategy in {'SCALP', config.SCALP_STRATEGY_ID}:
+                    continue
                 quote = fresh.get(position.symbol)
                 if quote is None:
                     position.monitoring_status = "PRICE_MONITORING_DEGRADED"
@@ -190,6 +204,8 @@ class FastPositionWatcher:
             hard_loss = (all(p.symbol in fresh for p in state.open_positions)
                          and state.daily_pnl + state.unrealized_pnl <= -state.starting_capital * config.MAX_DAILY_LOSS_PERCENT)
             for position in list(state.open_positions):
+                if position.strategy in {'SCALP', config.SCALP_STRATEGY_ID}:
+                    continue
                 quote = fresh.get(position.symbol)
                 if quote is None or quote.is_market_open is not True or quote.exit_price is None:
                     degraded = True
@@ -208,8 +224,8 @@ class FastPositionWatcher:
                 carried = entry and entry.astimezone(ZoneInfo(config.MARKET_TIMEZONE)).date() < now.astimezone(ZoneInfo(config.MARKET_TIMEZONE)).date()
                 cutoff = (now >= quote.session_close - timedelta(minutes=config.FORCE_EXIT_MINUTES_BEFORE_CLOSE)
                           if quote.session_close else self.executor.engine.market_closing(now))
-                if reason is None and (cutoff or carried):
-                    reason = "END_OF_DAY_EXIT"
+                if cutoff or carried:
+                    reason = "MISSED_EOD_RECOVERY_EXIT" if carried else "END_OF_DAY_EXIT"
                 if reason is None and hard_loss:
                     reason = "HARD_RISK_EXIT"
                 if reason:
@@ -246,3 +262,7 @@ class FastPositionWatcher:
                            provider_metrics=dict(getattr(self.provider, "metrics", {})))
         atomic_json(self.status_path, self.status)
         return dict(self.status)
+
+
+# Backward-compatible public name; one implementation owns position monitoring.
+FastPositionWatcher = PositionController

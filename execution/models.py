@@ -70,8 +70,13 @@ class TradePlan:
     news_context: Mapping[str, Any] = field(default_factory=dict)
     sector_context: Mapping[str, Any] = field(default_factory=dict)
     market_context: Mapping[str, Any] = field(default_factory=dict)
+    episode_id: str = ''
+    research_cycle_id: str = ''
+    entry_intent_id: str = ''
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, 'episode_id', self.episode_id or 'legacy:' + self.trade_id)
+        object.__setattr__(self, 'entry_intent_id', self.entry_intent_id or 'entry:' + self.episode_id)
         symbol = self.symbol.upper().strip()
         if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", symbol):
             raise TradePlanError("symbol is invalid")
@@ -150,7 +155,9 @@ def build_trade_plan(
         return default
 
     return TradePlan(
-        trade_id=trade_id or str(uuid.uuid4()),
+        trade_id=trade_id or (str(uuid.uuid5(uuid.NAMESPACE_URL, 'shadow-entry:' + str(coordinator['episode_id']))) if coordinator.get('episode_id') else str(uuid.uuid4())),
+        episode_id=str(coordinator.get('episode_id') or ''),
+        research_cycle_id=str(coordinator.get('research_cycle_id') or ''),
         symbol=str(coordinator.get("symbol", "")),
         side="BUY",
         strategy=str(coordinator.get("setup_name") or "INTRADAY_MOMENTUM_V1"),

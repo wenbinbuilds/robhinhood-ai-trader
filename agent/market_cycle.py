@@ -29,6 +29,7 @@ from agent.technical_agent import TechnicalAgent
 from execution.base import ExecutionRouter
 from execution.models import TradePlanError, build_trade_plan
 from execution.order_state import ExecutionAuditLog
+from execution.pre_execution import PreExecutionRiskContext, PreExecutionValidator
 from execution.shadow_executor import ShadowExecutor
 from risk.risk_manager import RiskManager, RiskRequest
 from shadow.execution import ShadowExecutionEngine
@@ -452,6 +453,8 @@ class MarketCycle:
         coordinator: CoordinatorAgent | None = None,
         reasoning_bridge: LlmReasoningProvider | None = None,
         shadow_portfolio: ShadowPortfolio | None = None,
+        pre_execution_refresher=None,
+        pre_execution_validator: PreExecutionValidator | None = None,
         state_path: str | Path = "state/session.json",
         logs_dir: str | Path = "logs",
         clock: Callable[[], datetime] | None = None,
@@ -469,6 +472,11 @@ class MarketCycle:
         self.logs_dir = Path(logs_dir)
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.shadow_portfolio = shadow_portfolio
+        self.pre_execution_refresher = pre_execution_refresher
+        self.pre_execution_validator = pre_execution_validator or PreExecutionValidator(
+            technical_agent=self.technical_agent,
+            risk_manager=self.risk_manager,
+        )
         if config.MODE == "SHADOW_TRADING" and self.shadow_portfolio is None:
             self.shadow_portfolio = ShadowPortfolio(
                 self.state_path.parent / "shadow_portfolio.json",
@@ -658,22 +666,18 @@ class MarketCycle:
             for position in positions
             if (_as_float(position.get("quantity")) or 0) != 0
         }
+        shadow_held_symbols: set[str] = set()
         if self.shadow_portfolio is not None:
-            held_symbols.update(
-                position.symbol for position in self.shadow_portfolio.snapshot().open_positions
-            )
+            shadow_held_symbols = {
+                position.symbol
+                for position in self.shadow_portfolio.snapshot().open_positions
+            }
+            held_symbols.update(shadow_held_symbols)
         candidate_payloads: dict[str, Mapping[str, Any]] = {}
         candidate_records: list[dict[str, Any]] = []
 
         for scanner_index, symbol in enumerate(symbols):
-            if symbol in held_symbols:
-                if (
-                    self.shadow_portfolio is not None
-                    and self.shadow_portfolio.has_symbol(symbol)
-                ):
-                    rejected_shadow_candidates.append(
-                        {"symbol": symbol, "reason": "DUPLICATE_POSITION"}
-                    )
+            if symbol in held_symbols and symbol not in shadow_held_symbols:
                 analyzed.append(
                     {
                         "decision": "NO_TRADE",
@@ -778,6 +782,7 @@ class MarketCycle:
                     "technical": technical,
                     "news": news,
                     "sector": sector,
+                    "position_open": symbol in shadow_held_symbols,
                 }
             )
 
@@ -797,6 +802,7 @@ class MarketCycle:
 
         for candidate_record in candidate_records:
             symbol = candidate_record["symbol"]
+            position_open = bool(candidate_record.get("position_open"))
             technical = candidate_record["technical"]
             news = candidate_record["news"]
             sector = candidate_record["sector"]
@@ -811,7 +817,7 @@ class MarketCycle:
                 llm_failure_reason=reasoning_result.failure_reason,
             )
             risk_record: dict[str, Any] | None = None
-            if coordinated.decision == "TRADE_CANDIDATE":
+            if coordinated.decision == "TRADE_CANDIDATE" and not position_open:
                 plan = technical.candidate_plan
                 if self.shadow_portfolio is not None:
                     shadow_state = self.shadow_portfolio.snapshot()
@@ -889,7 +895,10 @@ class MarketCycle:
             analyzed.append(
                 {
                     **dict(technical.candidate_plan),
-                    "decision": coordinated.decision,
+                    "decision": (
+                        "POSITION_CONTEXT_UPDATED"
+                        if position_open else coordinated.decision
+                    ),
                     "preliminary_scanner_score": candidate_record["scanner_score"],
                     "preliminary_scanner_rank": candidate_record["scanner_index"] + 1,
                     "scanner_evidence": dict(candidate_record["scanner_row"]),
@@ -929,6 +938,10 @@ class MarketCycle:
                     "errors": [],
                 }
             )
+            if position_open:
+                # Research remains available to position management, but an
+                # active shadow position never re-enters candidate admission.
+                continue
             if coordinated.decision == "TRADE_CANDIDATE" and risk_record:
                 approved_candidates.append((coordinated.to_dict(), risk_record))
             elif coordinated.decision == "WATCH":
@@ -1000,48 +1013,100 @@ class MarketCycle:
             )
             simulation_input = {
                 **coordinated,
+                'research_cycle_id': now.isoformat(),
                 "news_context": analyzed_row.get("news_context", {}),
                 "technical_context": analyzed_row.get("technical_context", {}),
                 "sector_context": analyzed_row.get("sector_context", {}),
                 "market_context": analyzed_row.get("market_context", {}),
             }
-            try:
-                trade_plan = build_trade_plan(
+            direct_entry = (
+                config.MODE == "SHADOW_TRADING"
+                and not config.SHADOW_ENTRY_VIA_FAST_WATCHLIST
+            )
+            execution_market_data = candidate_payloads.get(symbol, {})
+            execution_now = self.clock()
+            if execution_now.tzinfo is None:
+                execution_now = execution_now.replace(tzinfo=timezone.utc)
+            if direct_entry and self.shadow_portfolio is not None:
+                shadow_state = self.shadow_portfolio.snapshot()
+                refresh_result = self.pre_execution_validator.evaluate(
                     simulation_input,
-                    decision.get("theoretical_risk", {}),
-                    candidate_payloads.get(symbol, {}),
-                    now=now,
+                    self.pre_execution_refresher,
+                    PreExecutionRiskContext(
+                        account_equity=shadow_state.equity,
+                        available_buying_power=shadow_state.cash,
+                        daily_realized_pnl=shadow_state.daily_pnl,
+                        open_positions=len(shadow_state.open_positions),
+                        trades_today=shadow_state.trades_today,
+                    ),
+                    now=execution_now,
+                    canonical_context=execution_market_data,
                 )
+                decision["pre_execution_refresh"] = dict(refresh_result.log_record)
+                self.shadow_portfolio.journal.validation(refresh_result)
+                self._append_log(_redact(refresh_result.log_record), execution_now)
+                if not refresh_result.approved or refresh_result.plan is None:
+                    reason = refresh_result.reason or "PRE_EXECUTION_REFRESH_REJECTED"
+                    rejected_shadow_candidates.append({"symbol": symbol, "reason": reason})
+                    vetoed = self.coordinator.veto(coordinated, reason)
+                    analyzed_row["coordinator_decision"] = vetoed
+                    analyzed_row["decision"] = "NO_TRADE"
+                    decision = {
+                        "type": "NO_TRADE",
+                        "reason": reason,
+                        "candidate": vetoed,
+                        "pre_execution_refresh": dict(refresh_result.log_record),
+                        "executed": False,
+                        "analysis_only": True,
+                    }
+                    trade_plan = None
+                else:
+                    trade_plan = refresh_result.plan
+                    execution_market_data = refresh_result.market_data
+            else:
+                try:
+                    trade_plan = build_trade_plan(
+                        simulation_input,
+                        decision.get("theoretical_risk", {}),
+                        execution_market_data,
+                        now=now,
+                    )
+                except TradePlanError:
+                    trade_plan = None
+            try:
+                if trade_plan is None:
+                    raise TradePlanError("pre-execution plan unavailable")
             except TradePlanError as exc:
-                rejection = {
-                    "symbol": symbol,
-                    "reason": "INVALID_TRADE_PLAN",
-                    "details": [str(exc)],
-                }
-                rejected_shadow_candidates.append(rejection)
-                vetoed = self.coordinator.veto(
-                    coordinated, "INVALID_TRADE_PLAN"
-                )
-                analyzed_row["coordinator_decision"] = vetoed
-                analyzed_row["decision"] = "NO_TRADE"
-                decision = {
-                    "type": "NO_TRADE",
-                    "reason": "INVALID_TRADE_PLAN",
-                    "candidate": vetoed,
-                    "executed": False,
-                    "analysis_only": True,
-                }
+                if decision.get("pre_execution_refresh"):
+                    # The exact refresh rejection was already recorded above.
+                    pass
+                else:
+                    rejection = {
+                        "symbol": symbol,
+                        "reason": "INVALID_TRADE_PLAN",
+                        "details": [str(exc)],
+                    }
+                    rejected_shadow_candidates.append(rejection)
+                    vetoed = self.coordinator.veto(
+                        coordinated, "INVALID_TRADE_PLAN"
+                    )
+                    analyzed_row["coordinator_decision"] = vetoed
+                    analyzed_row["decision"] = "NO_TRADE"
+                    decision = {
+                        "type": "NO_TRADE",
+                        "reason": "INVALID_TRADE_PLAN",
+                        "candidate": vetoed,
+                        "executed": False,
+                        "analysis_only": True,
+                    }
             else:
                 decision["trade_plan"] = trade_plan.to_dict()
-                if (
-                    config.MODE == "SHADOW_TRADING"
-                    and not config.SHADOW_ENTRY_VIA_FAST_WATCHLIST
-                ):
+                if direct_entry:
                     execution_result = self.execution_router.route(
                         config.MODE,
                         trade_plan,
-                        now=self.clock(),  # Revalidate quote age and cutoff AFTER slow reasoning.
-                        market_data=candidate_payloads.get(symbol, {}),
+                        now=execution_now,
+                        market_data=execution_market_data,
                     )
                     decision["execution_result"] = execution_result.to_dict()
                     if execution_result.status != "FILLED":
@@ -1163,35 +1228,44 @@ class MarketCycle:
                 failure_reason="NO_ELIGIBLE_CANDIDATES",
             )
 
-        shadow_positions: list[dict[str, Any]] = []
-        if self.shadow_portfolio is not None:
-            shadow_positions = [
-                {
-                    "symbol": item.symbol,
-                    "quantity": item.quantity,
-                    "entry_price": item.entry_price,
-                    "stop_price": item.stop,
-                    "target_price": item.target,
-                }
-                for item in self.shadow_portfolio.snapshot().open_positions
-            ]
         reasoning_candidates: list[dict[str, Any]] = []
         for item in candidates:
             technical = item["technical"]
             news = item["news"]
             sector = item["sector"]
-            source_payload = item["payload"]
+            validation = technical.metrics.get("technical_validation", {})
+            rules = validation.get("rules", []) if isinstance(validation, Mapping) else []
+            gate_status = {
+                str(rule.get("rule_name")): str(rule.get("status"))
+                for rule in rules
+                if isinstance(rule, Mapping) and rule.get("rule_name") in {
+                    "PRICE_VS_VWAP", "EMA_STRUCTURE", "RSI", "MACD",
+                    "RELATIVE_VOLUME", "CANDLE_STRUCTURE",
+                }
+            } if isinstance(rules, Sequence) else {}
             reasoning_candidates.append(
                 {
                     "symbol": item["symbol"],
-                    "preliminary_scanner_rank": int(item["scanner_index"]) + 1,
-                    "preliminary_scanner_score": item["scanner_score"],
-                    "scanner_evidence": dict(item["scanner_row"]),
-                    "deterministic_technical_metrics": dict(technical.metrics),
-                    "deterministic_technical_assessment": technical.context.to_dict(),
-                    "deterministic_proposed_setup": dict(technical.candidate_plan),
-                    "deterministic_news_event_clusters": self._bounded_news_clusters(news),
-                    "deterministic_news_context": {
+                    "technical_summary": {
+                        "technical_disposition": technical.candidate_plan.get(
+                            "technical_disposition"
+                        ),
+                        "technical_score": technical.context.technical_score,
+                        "technical_confidence": technical.context.confidence,
+                        "price_vs_vwap": technical.context.price_vs_vwap,
+                        "ema_structure": technical.context.ema_structure,
+                        "rsi14": technical.metrics.get("rsi14"),
+                        "macd_state": technical.context.macd_state,
+                        "relative_volume": technical.metrics.get("relative_volume"),
+                        "candle_structure": technical.context.price_action_state,
+                        "hard_gates": (
+                            "PASS" if not validation.get("true_hard_gate_failures")
+                            else "FAIL"
+                        ) if isinstance(validation, Mapping) else "UNKNOWN",
+                        "gate_status": gate_status,
+                    },
+                    "news_events": self._bounded_news_clusters(news),
+                    "news_context": {
                         "status": (
                             "UNAVAILABLE"
                             if "news" in news.unavailable_fields else "AVAILABLE"
@@ -1200,37 +1274,21 @@ class MarketCycle:
                         "catalyst_type": news.catalyst_type,
                         "sentiment": news.sentiment,
                     },
-                    "deterministic_sector_classification": sector.to_dict(),
-                    "sector_benchmark": self._bounded_benchmark(
-                        source_payload.get("sector_benchmark")
-                    ),
+                    "sector_context": {
+                        "sector": sector.sector,
+                        "sector_bias": sector.sector_bias,
+                        "sector_driver": sector.sector_driver,
+                        "confidence": sector.confidence,
+                    },
                 }
             )
-        benchmarks = market.get("benchmarks", [])
-        bounded_benchmarks = [
-            self._bounded_benchmark(item)
-            for item in benchmarks
-            if isinstance(item, Mapping)
-        ] if isinstance(benchmarks, Sequence) and not isinstance(
-            benchmarks, (str, bytes)
-        ) else []
         payload = {
             "schema_version": config.LLM_REASONING_SCHEMA_VERSION,
             "prompt_version": config.LLM_REASONING_PROMPT_VERSION,
             "analysis_timestamp": now.isoformat(),
             "broad_market_context": {
                 "deterministic_interpretation": dict(macro_context),
-                "benchmarks": bounded_benchmarks,
             },
-            "current_real_positions": [
-                {
-                    "symbol": str(item.get("symbol", "")).upper(),
-                    "quantity": _as_float(item.get("quantity")),
-                }
-                for item in positions
-                if item.get("symbol")
-            ],
-            "current_shadow_positions": shadow_positions,
             "candidates": reasoning_candidates,
         }
         expected_symbols = [str(item["symbol"]) for item in candidates]

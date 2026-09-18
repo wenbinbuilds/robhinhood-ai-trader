@@ -113,6 +113,7 @@ class LlmReasoningBridge:
         self.which = which
         self.monotonic = monotonic
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self._validated_models: set[str] = set()
 
     def _resolve(self, value: str | Path) -> Path:
         path = Path(value)
@@ -128,7 +129,11 @@ class LlmReasoningBridge:
         analysis_time = _utc(now)
         current = _utc(self.clock())
         started = self.monotonic()
-        self._diagnostics = {"returncode": None, "timeout": False, "stderr": "", "stdout": "", "schema_errors": []}
+        construction_started = started
+        self._diagnostics = {
+            "returncode": None, "timeout": False, "stderr": "", "stdout": "",
+            "schema_errors": [], "profile": {},
+        }
         symbols = tuple(str(item).upper() for item in expected_symbols)
         explicit_model = config.CODEX_REASONING_MODEL
         model_identifier = (
@@ -152,19 +157,24 @@ class LlmReasoningBridge:
                 current, symbols, "REASONING_PAYLOAD_TOO_LARGE", started,
                 model_identifier,
             )
+        serialization_finished = self.monotonic()
 
         codex = self.which("codex")
         if not codex:
             return self._failure(
                 current, symbols, "CODEX_NOT_INSTALLED", started, model_identifier
             )
-        if model_identifier is not None:
+        preflight_started = self.monotonic()
+        if model_identifier is not None and model_identifier not in self._validated_models:
             model_failure = self._validate_model(codex, model_identifier)
             if model_failure is not None:
                 return self._failure(
                     current, symbols, model_failure, started, model_identifier
                 )
+            self._validated_models.add(model_identifier)
+        preflight_finished = self.monotonic()
 
+        prompt_read_started = self.monotonic()
         try:
             prompt = self.prompt_path.read_text(encoding="utf-8")
             schema = json.loads(self.schema_path.read_text(encoding="utf-8"))
@@ -177,6 +187,32 @@ class LlmReasoningBridge:
                 started,
                 model_identifier,
             )
+        construction_finished = self.monotonic()
+        input_text = f"{prompt}\n\nINPUT_JSON:\n{serialized}\n"
+        profile = {
+            "model": model_identifier,
+            "reasoning_effort": config.CODEX_REASONING_EFFORT,
+            "candidate_count": len(symbols),
+            "input_chars": len(serialized),
+            "prompt_chars": len(input_text),
+            "input_tokens_estimate": round(len(input_text) / 4),
+            "prompt_construction_ms": round(
+                (
+                    max(0.0, serialization_finished - construction_started)
+                    + max(0.0, construction_finished - prompt_read_started)
+                ) * 1000,
+                3,
+            ),
+            "startup_ms": round(
+                max(0.0, preflight_finished - preflight_started) * 1000, 3
+            ),
+            "inference_ms": None,
+            "parse_ms": None,
+            "total_ms": None,
+            "output_chars": None,
+            "output_tokens_estimate": None,
+        }
+        self._diagnostics["profile"] = profile
 
         output_path = self._temporary_output_path()
         command = self.build_exec_command(codex, output_path, model_identifier)
@@ -186,16 +222,26 @@ class LlmReasoningBridge:
         ]
         try:
             try:
+                inference_started = self.monotonic()
                 completed = self.command_runner(
                     command,
                     cwd=self.project_dir,
-                    input=f"{prompt}\n\nINPUT_JSON:\n{serialized}\n",
+                    input=input_text,
                     text=True,
                     capture_output=True,
                     timeout=config.CODEX_LLM_REASONING_TIMEOUT_SECONDS,
                     check=False,
                 )
+                profile["inference_ms"] = round(
+                    max(0.0, self.monotonic() - inference_started) * 1000, 3
+                )
             except subprocess.TimeoutExpired as exc:
+                profile["inference_ms"] = round(
+                    max(0.0, self.monotonic() - inference_started) * 1000, 3
+                )
+                profile["total_ms"] = round(
+                    max(0.0, self.monotonic() - started) * 1000, 3
+                )
                 self._diagnostics.update(timeout=True, stderr=sanitized_diagnostics(exc.stderr), stdout=sanitized_diagnostics(exc.stdout))
                 return self._failure(
                     current, symbols, "LLM_REASONING_TIMEOUT", started,
@@ -223,8 +269,10 @@ class LlmReasoningBridge:
                     started,
                     model_identifier,
                 )
+            parse_started = self.monotonic()
             try:
-                raw = json.loads(output_path.read_text(encoding="utf-8"))
+                raw_text = output_path.read_text(encoding="utf-8")
+                raw = json.loads(raw_text)
             except (OSError, json.JSONDecodeError):
                 return self._failure(
                     current, symbols, "LLM_REASONING_INVALID_JSON", started,
@@ -260,7 +308,13 @@ class LlmReasoningBridge:
                     started,
                     model_identifier,
                 )
+            profile["parse_ms"] = round(
+                max(0.0, self.monotonic() - parse_started) * 1000, 3
+            )
+            profile["output_chars"] = len(raw_text)
+            profile["output_tokens_estimate"] = round(len(raw_text) / 4)
             duration = max(0.0, self.monotonic() - started)
+            profile["total_ms"] = round(duration * 1000, 3)
             trace = ReasoningTrace(
                 reasoning_provider="CODEX_CLI",
                 model_identifier=model_identifier,
@@ -294,7 +348,7 @@ class LlmReasoningBridge:
             "--ephemeral",
             "--skip-git-repo-check",
             "--config",
-            'web_search="live"',
+            f'web_search="{config.CODEX_REASONING_WEB_SEARCH}"',
             "--config",
             f'model_reasoning_effort="{config.CODEX_REASONING_EFFORT}"',
             "--sandbox",
@@ -468,6 +522,11 @@ def _failure_result(
     model_identifier: str | None,
     status: str = "FAILED",
 ) -> LlmReasoningResult:
+    effective_status = (
+        "TIMEOUT" if reason == "LLM_REASONING_TIMEOUT"
+        else "ERROR" if status == "FAILED"
+        else status
+    )
     trace = ReasoningTrace(
         reasoning_provider="CODEX_CLI",
         model_identifier=model_identifier,
@@ -476,7 +535,7 @@ def _failure_result(
         candidate_count=candidate_count,
         schema_version=config.LLM_REASONING_SCHEMA_VERSION,
         prompt_version=config.LLM_REASONING_PROMPT_VERSION,
-        status=status,
+        status=effective_status,
         failure_reason=reason,
         token_usage=None,
     )

@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import timedelta
 
 import config
+import runner
 from agent.candidate_analyzer import CandidateData
 from agent.technical_agent import TechnicalAgent
 from agent.llm_reasoning_bridge import sanitized_diagnostics
@@ -140,6 +141,42 @@ def test_terminal_includes_concise_technical_validation_audit():
     assert "SPREAD: PASS (HARD)" in output
     assert "TRUE HARD GATES:" in output
     assert "TECHNICAL SETUP: QUALIFIED" in output
+
+
+def test_diagnostics_tolerate_missing_none_and_partial_nested_objects():
+    base = {
+        "llm_reasoning": None,
+        "decision": {"type": "NO_TRADE"},
+    }
+    cases = [
+        [],
+        [{"symbol": "MISSING"}],
+        [{"symbol": "NONE", "coordinator_decision": None}],
+        [{"symbol": "NO_SCORE", "coordinator_decision": {}}],
+        [{
+            "symbol": "OPEN",
+            "decision": "POSITION_CONTEXT_UPDATED",
+            "coordinator_decision": None,
+            "deterministic_technical_metrics": None,
+            "technical_context": None,
+        }],
+        [None, "malformed", {"symbol": "PARTIAL"}],
+    ]
+    for rows in cases:
+        output = "\n".join(cycle_diagnostic_lines({**base, "analyzed_candidates": rows}))
+        assert "CANDIDATES ANALYZED:" in output
+
+
+def test_runner_isolates_diagnostic_renderer_failure(monkeypatch, capsys):
+    def broken(_result):
+        yield "BEFORE FAILURE"
+        raise AttributeError("fixture")
+
+    monkeypatch.setattr(runner, "cycle_diagnostic_lines", broken)
+    runner.print_cycle_diagnostics({"decision": {"type": "NO_TRADE"}})
+    output = capsys.readouterr().out
+    assert "BEFORE FAILURE" in output
+    assert "DIAGNOSTICS STATUS: DEGRADED (AttributeError; cycle continued)" in output
 
 
 def test_safe_diagnostics_do_not_persist_echoed_prompts():

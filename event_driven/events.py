@@ -8,6 +8,7 @@ from enum import Enum, IntEnum
 from types import MappingProxyType
 from typing import Any, ClassVar, Mapping
 from uuid import uuid4
+from copy import deepcopy
 
 
 class EventPriority(IntEnum):
@@ -19,6 +20,7 @@ class EventPriority(IntEnum):
 
 
 class EventType(str, Enum):
+    STATE_RECONCILED = 'STATE_RECONCILED'
     QUOTE = "QUOTE"
     BAR_CLOSED = "BAR_CLOSED"
     SCANNER = "SCANNER"
@@ -52,6 +54,7 @@ class MarketEvent:
     payload: Mapping[str, Any] = field(default_factory=dict)
     event_id: str = field(default_factory=lambda: uuid4().hex)
     priority: EventPriority | None = None
+    episode_id: str | None = None
 
     event_type: ClassVar[EventType] = EventType.INFRASTRUCTURE_ERROR
     default_priority: ClassVar[EventPriority] = EventPriority.LOW
@@ -62,7 +65,9 @@ class MarketEvent:
         object.__setattr__(self, "timestamp", self.timestamp.astimezone(timezone.utc))
         if self.symbol:
             object.__setattr__(self, "symbol", self.symbol.upper())
-        object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))
+        object.__setattr__(self, "payload", MappingProxyType(deepcopy(dict(self.payload))))
+        if self.episode_id is None:
+            object.__setattr__(self, 'episode_id', self.payload.get('episode_id'))
         if self.priority is None:
             object.__setattr__(self, "priority", self.default_priority)
 
@@ -73,6 +78,7 @@ class MarketEvent:
             "symbol": self.symbol,
             "source": self.source,
             "cycle_id": self.cycle_id,
+            "episode_id": self.episode_id,
             "event_id": self.event_id,
             "priority": self.priority.name if self.priority is not None else None,
             "payload": dict(self.payload),
@@ -82,6 +88,11 @@ class MarketEvent:
 class QuoteEvent(MarketEvent):
     event_type = EventType.QUOTE
     default_priority = EventPriority.MEDIUM
+
+
+class StateReconciledEvent(MarketEvent):
+    event_type = EventType.STATE_RECONCILED
+    default_priority = EventPriority.CRITICAL
 
 
 class BarClosedEvent(MarketEvent):
@@ -187,6 +198,7 @@ class InfrastructureErrorEvent(MarketEvent):
 EVENT_CLASSES = {
     cls.event_type: cls
     for cls in (
+        StateReconciledEvent,
         QuoteEvent, BarClosedEvent, ScannerEvent, CandidateDiscoveredEvent,
         CandidateStillActiveEvent, CandidateRemovedEvent, CandidateStateChangedEvent, ContextUpdatedEvent,
         NewsUpdatedEvent, AlphaUpdatedEvent, TradeCandidateEvent,

@@ -19,7 +19,7 @@ from execution.execution_guard import (
     ExecutionGuard,
     read_kill_switch,
 )
-from execution.models import ExecutionResult, TradePlan
+from execution.models import ExecutionResult, TradePlan, parse_timestamp
 from execution.order_state import (
     ExecutionAuditLog,
     ExecutionState,
@@ -79,6 +79,7 @@ class LiveExecutionInputs:
     daily_realized_pnl: float | None
     trading_date: str
     confirmation_token: str | None = None
+    pre_execution_refresh: Mapping[str, Any] | None = None
 
 
 class RobinhoodExecutor:
@@ -119,6 +120,30 @@ class RobinhoodExecutor:
         current = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
         current = current.astimezone(timezone.utc)
         early_reasons = self._configuration_rejections(inputs)
+        refresh = inputs.pre_execution_refresh
+        refresh_at = (
+            parse_timestamp(refresh.get("timestamp"))
+            if isinstance(refresh, Mapping) else None
+        )
+        refresh_age = (
+            (current - refresh_at).total_seconds()
+            if refresh_at is not None else None
+        )
+        refreshed_quote_age = (
+            refresh.get("refreshed_quote_age_seconds")
+            if isinstance(refresh, Mapping) else None
+        )
+        if (
+            not isinstance(refresh, Mapping)
+            or refresh.get("event") != "PRE_EXECUTION_REFRESH"
+            or refresh.get("status") != "APPROVED"
+            or str(refresh.get("symbol", "")).upper() != plan.symbol
+            or refresh_age is None
+            or not 0 <= refresh_age <= config.PRE_EXECUTION_MAX_QUOTE_AGE_SECONDS
+            or not isinstance(refreshed_quote_age, (int, float))
+            or not 0 <= float(refreshed_quote_age) <= config.PRE_EXECUTION_MAX_QUOTE_AGE_SECONDS
+        ):
+            early_reasons = (*early_reasons, "PRE_EXECUTION_REFRESH_REQUIRED")
         if early_reasons:
             return self._reject(plan, current, early_reasons, "NOT_ATTEMPTED")
 

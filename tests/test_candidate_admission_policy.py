@@ -26,6 +26,7 @@ from watcher.candidate_watcher import FastCandidateWatcher, LiveScore
 from watcher.models import FastQuote
 from test_coordinator import inputs, llm_analysis
 from test_market_cycle import NOW, bullish_candidate
+from test_candidate_watchlist import FreshRefresher
 
 
 def mrna_like_assessment():
@@ -208,6 +209,7 @@ def test_warned_candidate_can_improve_or_decline_with_hysteresis(tmp_path):
         cache, ShadowExecutionEngine(portfolio),
         events_path=tmp_path / "events.jsonl",
         score_history_path=tmp_path / "scores.jsonl", scorer=scorer,
+        pre_execution_refresher=FreshRefresher(),
     )
     observed = []
     for seconds in (1, 3, 5, 7):
@@ -245,6 +247,7 @@ def test_warned_candidate_cannot_bypass_daily_loss_limit(tmp_path):
         events_path=tmp_path / "events.jsonl",
         score_history_path=tmp_path / "scores.jsonl",
         scorer=SequenceScorer([1, 1]),
+        pre_execution_refresher=FreshRefresher(),
     )
     for seconds in (1, 3):
         at = NOW + timedelta(seconds=seconds)

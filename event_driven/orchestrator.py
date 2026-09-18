@@ -23,6 +23,7 @@ from event_driven.events import (
     ContextExpiredEvent,
     ContextUpdatedEvent,
     ExitRequestedEvent,
+    InfrastructureErrorEvent,
     MarketEvent,
     NewsUpdatedEvent,
     PositionClosedEvent,
@@ -90,7 +91,8 @@ class ShadowEventOrchestrator:
 
     def __init__(self, *, state_path: str | Path, event_log_path: str | Path,
                  bus: InProcessEventBus | None = None,
-                 terminal_output: bool = False) -> None:
+                 terminal_output: bool = False,
+                 shadow_portfolio=None) -> None:
         if config.MODE != "SHADOW_TRADING":
             raise ValueError("event orchestrator is SHADOW_TRADING only")
         self.bus = bus or InProcessEventBus()
@@ -100,6 +102,9 @@ class ShadowEventOrchestrator:
         if terminal_output:
             self.bus.subscribe(None, self._terminal_report)
         self._lock = RLock()
+        self.shadow_portfolio = shadow_portfolio
+        self.state_store.portfolio = shadow_portfolio
+        self._reported_consistency_errors: set[tuple[str, str]] = set()
         self._universe: set[str] = {
             item.symbol for item in self.state_store.snapshot(include_terminal=False)
         }
@@ -136,9 +141,55 @@ class ShadowEventOrchestrator:
                     transition_history=getattr(position, "state_transition_history", ()),
                 )
 
+    def attach_shadow_portfolio(self, portfolio) -> None:
+        """Bind the one local portfolio used to verify position ownership."""
+
+        if self.shadow_portfolio is not None and self.shadow_portfolio is not portfolio:
+            raise ValueError("event runtime and watchers must share one ShadowPortfolio")
+        self.shadow_portfolio = portfolio
+        self.state_store.portfolio = portfolio
+
+    def reconcile_position_state(self, *, now: datetime,
+                                 cycle_id: str | None = None) -> None:
+        """Diagnose and safely project every active/open symbol across stores."""
+
+        if self.shadow_portfolio is None:
+            return
+        portfolio_symbols = {
+            item.symbol.upper()
+            for item in self.shadow_portfolio.snapshot().open_positions
+        }
+        state_symbols = {
+            item.symbol
+            for item in self.state_store.snapshot()
+            if item.state in {CandidateState.POSITION_OPEN, CandidateState.EXIT_PENDING}
+        }
+        for symbol in sorted(portfolio_symbols | state_symbols):
+            self._position_is_open(symbol, now=now, cycle_id=cycle_id)
+
+    def _position_is_open(self, symbol: str, *, now: datetime,
+                          cycle_id: str | None = None) -> bool:
+        """Reconcile explicit local stores without allowing pre-entry downgrades."""
+
+        if self.shadow_portfolio is not None:
+            from trading_runtime.reconciliation import ReconciliationService
+            return ReconciliationService(self.shadow_portfolio, self.state_store, self.emit).reconcile(symbol, now=now)
+        # Standalone simulation projection; production always binds a portfolio.
+        state = self.state_store.get(symbol.upper())
+        return state is not None and state.state in {
+            CandidateState.POSITION_OPEN, CandidateState.EXIT_PENDING,
+        }
+
     def emit(self, item: MarketEvent) -> None:
         # State projection is immediate/deterministic; optional consumers are
         # isolated behind the bounded priority queue.
+        from dataclasses import replace
+        state = self.state_store.get(item.symbol) if item.symbol else None
+        if not item.episode_id and state and state.episode_id:
+            item = replace(item, episode_id=state.episode_id)
+        if item.event_type.value != 'QUOTE':
+            # Durable before dispatch; the async logger deduplicates by event ID.
+            self.logger.journal.append_market_event(item)
         self.state_store.handle(item)
         self.bus.publish(item)
 
@@ -149,8 +200,9 @@ class ShadowEventOrchestrator:
         updated = self.state_store.transition(
             symbol, new_state, timestamp=now, event_type=event_type, reason=reason
         )
-        self.bus.publish(CandidateStateChangedEvent(
+        self.emit(CandidateStateChangedEvent(
             now, "CANDIDATE_STATE_MACHINE", symbol=symbol,
+            episode_id=updated.episode_id or None,
             payload={"previous_state": previous, "new_state": updated.state.value,
                      "reason": reason or event_type},
         ))
@@ -178,14 +230,20 @@ class ShadowEventOrchestrator:
         reasoning_cached = reasoning_trace.get("status") == "CACHED"
         for row in analyzed_rows:
             symbol = str(row.get("symbol", "")).upper()
+            position_open = self._position_is_open(
+                symbol, now=now, cycle_id=cycle_id
+            )
             existing = self.state_store.get(symbol)
-            if existing is None or existing.state in {
+            if not position_open and (existing is None or existing.state in {
                 CandidateState.CLOSED, CandidateState.EXPIRED, CandidateState.REJECTED
-            }:
+            }):
                 self.emit(CandidateDiscoveredEvent(now, "SLOW_RESEARCH", symbol=symbol, cycle_id=cycle_id))
                 self.transition(symbol, CandidateState.WATCHLIST, now=now, event_type="RESEARCH_ADMISSION")
             existing = self.state_store.get(symbol)
             context = admitted.get(symbol)
+            if existing is not None and not position_open:
+                from trading_runtime.setup_controller import episode_id
+                self.state_store.update_facts(symbol, episode_id=(context.episode_id if context else episode_id(symbol, cycle_id)))
             research_timestamp = (
                 existing.research_timestamp
                 if reasoning_cached and existing and existing.research_timestamp
@@ -259,13 +317,28 @@ class ShadowEventOrchestrator:
                 true_hard_failures = ["TECHNICAL_VALIDATION"]
             before_alpha = self.state_store.get(symbol)
             permanently_rejected = bool(true_hard_failures or coordinator_vetoes)
-            intended_state = (
-                CandidateState.SETUP_FORMING.value
-                if context is not None else
-                CandidateState.REJECTED.value
-                if permanently_rejected else
-                CandidateState.WATCHLIST.value
-            )
+            if position_open:
+                invalidation_signals = list(dict.fromkeys(
+                    [*true_hard_failures, *coordinator_vetoes]
+                ))
+                open_context_status = (
+                    "DEGRADED" if invalidation_signals else "REFRESHED"
+                )
+                admission_reason = (
+                    "POSITION_INVALIDATION_SIGNAL: " + ",".join(invalidation_signals)
+                    if invalidation_signals else "OPEN_POSITION_CONTEXT_REFRESHED"
+                )
+                intended_state = before_alpha.state.value if before_alpha else CandidateState.POSITION_OPEN.value
+            else:
+                invalidation_signals = []
+                open_context_status = None
+                intended_state = (
+                    CandidateState.SETUP_FORMING.value
+                    if context is not None else
+                    CandidateState.REJECTED.value
+                    if permanently_rejected else
+                    CandidateState.WATCHLIST.value
+                )
             self.emit(AlphaUpdatedEvent(now, "SLOW_ALPHA", symbol=symbol, cycle_id=cycle_id,
                                         payload={"slow_alpha_score": slow_score,
                                                  "technical_score": _number(coordinator.get("technical_score", technical_context.get("technical_score"))),
@@ -276,15 +349,23 @@ class ShadowEventOrchestrator:
                                                  "market_score": _number(coordinator.get("market_score")),
                                                  "context_age_seconds": 0.0,
                                                  "context_ttl_seconds": config.CANDIDATE_CONTEXT_TTL_SECONDS,
-                                                 "eligible_for_fast_watch": context is not None,
+                                                 "eligible_for_fast_watch": context is not None and not position_open,
                                                  "admission_reason": admission_reason,
                                                  "true_hard_gate_failures": true_hard_failures,
                                                  "signal_quality_failures": signal_quality_failures,
+                                                 "open_position_context_status": open_context_status,
+                                                 "position_invalidation_signals": invalidation_signals,
+                                                 "context_action": "POSITION_CONTEXT_UPDATED" if position_open else "CANDIDATE_CONTEXT_UPDATED",
                                                  "previous_state": before_alpha.state.value if before_alpha else None,
                                                  "new_state": intended_state,
                                                  "research_timestamp": research_timestamp,
                                                  "reason": admission_reason}))
             current = self.state_store.get(symbol)
+            if position_open:
+                # Context and invalidation evidence were persisted above. Exit
+                # ownership remains with FastPositionWatcher; slow admission
+                # never maps an active position back into a candidate state.
+                continue
             if context is not None and current and current.state in {CandidateState.WATCHLIST, CandidateState.INFRASTRUCTURE_BLOCKED}:
                 self.transition(symbol, CandidateState.SETUP_FORMING, now=now,
                                 event_type="SLOW_ALPHA_READY")
@@ -329,13 +410,16 @@ class ShadowEventOrchestrator:
                                payload={"result_count": len(discovered)}))
         with self._lock:
             for symbol in sorted(discovered):
+                position_open = self._position_is_open(
+                    symbol, now=now, cycle_id=cycle_id
+                )
                 existing = self.state_store.get(symbol)
                 terminal = existing is not None and existing.state in {
                     CandidateState.CLOSED, CandidateState.EXPIRED, CandidateState.REJECTED
                 }
                 cls = (
                     CandidateStillActiveEvent
-                    if symbol in self._universe and not terminal
+                    if position_open or (symbol in self._universe and not terminal)
                     else CandidateDiscoveredEvent
                 )
                 self.emit(cls(now, "ROBINHOOD_SCANNER", symbol=symbol, cycle_id=cycle_id))
@@ -410,7 +494,7 @@ class ShadowEventOrchestrator:
             return
         if current.state in {
             CandidateState.DISCOVERED, CandidateState.WATCHLIST,
-            CandidateState.SETUP_FORMING,
+            CandidateState.SETUP_FORMING, CandidateState.TRADE_READY,
         }:
             self.transition(
                 symbol, CandidateState.INFRASTRUCTURE_BLOCKED, now=now,

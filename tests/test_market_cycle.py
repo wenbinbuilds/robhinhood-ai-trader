@@ -129,6 +129,21 @@ class MockRobinhoodDataProvider:
         return []
 
 
+class MockPreExecutionRefresher:
+    def __init__(self, data: Mapping[str, Any]) -> None:
+        self.data = data
+        self.calls: list[str] = []
+
+    def refresh_symbol(self, symbol: str, *, now: datetime) -> Mapping[str, Any]:
+        self.calls.append(symbol)
+        return {
+            "symbol": symbol,
+            **dict(self.data["candidate_data"][symbol]),
+            "quote_as_of": now.isoformat(),
+            "market_direction": "BULLISH",
+        }
+
+
 class SupportiveReasoningBridge:
     def __init__(self) -> None:
         self.calls = 0
@@ -383,16 +398,19 @@ def test_production_slow_cycle_never_opens_shadow_entry_directly(tmp_path: Path)
     assert portfolio.snapshot().open_positions == []
 
 
-def test_duplicate_shadow_scanner_candidate_is_logged(tmp_path: Path, monkeypatch) -> None:
+def test_open_shadow_scanner_rediscovery_is_context_only(tmp_path: Path, monkeypatch) -> None:
     # Compatibility coverage for the old direct-slow-entry route. Production
     # SHADOW_TRADING now routes new entries through the fast watchlist.
     monkeypatch.setattr(config, "SHADOW_ENTRY_VIA_FAST_WATCHLIST", False)
     portfolio = ShadowPortfolio(
         tmp_path / "shadow.json", tmp_path / "shadow_trades.jsonl"
     )
+    data = snapshot()
+    refresher = MockPreExecutionRefresher(data)
     first = MarketCycle(
-        MockRobinhoodDataProvider(snapshot()),
+        MockRobinhoodDataProvider(data),
         shadow_portfolio=portfolio,
+        pre_execution_refresher=refresher,
         state_path=tmp_path / "state" / "session.json",
         logs_dir=tmp_path / "logs",
         clock=lambda: NOW,
@@ -401,17 +419,19 @@ def test_duplicate_shadow_scanner_candidate_is_logged(tmp_path: Path, monkeypatc
     assert first["new_shadow_positions_opened"]
 
     second = MarketCycle(
-        MockRobinhoodDataProvider(snapshot()),
+        MockRobinhoodDataProvider(data),
         shadow_portfolio=portfolio,
+        pre_execution_refresher=refresher,
         state_path=tmp_path / "state" / "session.json",
         logs_dir=tmp_path / "logs",
         clock=lambda: NOW,
         reasoning_bridge=SupportiveReasoningBridge(),
     ).run()
     assert second["decision"]["type"] == "NO_TRADE"
-    assert second["rejected_shadow_candidates"] == [
-        {"symbol": "ACME", "reason": "DUPLICATE_POSITION"}
-    ]
+    assert second["rejected_shadow_candidates"] == []
+    assert second["analyzed_candidates"][0]["decision"] == "POSITION_CONTEXT_UPDATED"
+    assert second["analyzed_candidates"][0]["coordinator_decision"] is not None
+    assert len(portfolio.snapshot().open_positions) == 1
 
 
 def test_one_reasoning_invocation_handles_multiple_candidates(tmp_path: Path) -> None:

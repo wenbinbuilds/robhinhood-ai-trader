@@ -19,6 +19,12 @@ from watcher.scheduler import SlowMarketLoop, next_cycle_delay
 from watcher.status import shadow_dashboard_projection, print_status
 from watcher.storage import atomic_json, event
 from test_shadow_trading import NOW, opened, coordinator, quote, candle
+from agent.candidate_context import CandidateContextStore
+from shadow.execution import ShadowExecutionEngine
+from watcher.candidate_watcher import FastCandidateWatcher, LiveScore
+from test_candidate_watchlist import context as candidate_context
+from event_driven.reasoning import EventDrivenReasoningProvider
+from agent.models import LlmReasoningResult, ReasoningTrace
 
 
 @pytest.fixture(autouse=True)
@@ -140,6 +146,100 @@ def test_provider_error_sanitized_and_does_not_exit(tmp_path):
     assert w.metrics["quote_failures"] == 1
     assert "FAST_PROVIDER_ERROR" in w.events_path.read_text()
     assert "must-not-log-secret" not in w.events_path.read_text()
+
+
+def test_pre_execution_refresh_failure_blocks_entry_but_position_monitoring_continues(tmp_path):
+    class SplitQuotes(Quotes):
+        def get_quotes(self, symbols):
+            self.calls.append(list(symbols))
+            prices = {"ACME": 98.0, "NEW": 101.0}
+            return {
+                symbol: FastQuote(
+                    symbol, prices[symbol], prices[symbol] + .02,
+                    prices[symbol] + .01, NOW, self.name, True,
+                )
+                for symbol in symbols
+            }
+
+    class HighScore:
+        def score(self, context, quote):
+            return LiveScore(.99, {"fixture": {"value": .99, "weight": 1}})
+
+    class FailedRefresh:
+        def refresh_symbol(self, symbol, *, now):
+            raise TimeoutError("mocked")
+
+    watcher, portfolio, _engine, _position, _provider = setup_watcher(
+        tmp_path, SplitQuotes()
+    )
+    cache = CandidateContextStore(tmp_path / "candidates.json")
+    candidate = candidate_context(slow=.9)
+    candidate.symbol = "NEW"
+    candidate.consecutive_qualifying_updates = 1
+    cache.replace([candidate], now=NOW)
+    watcher.candidate_watcher = FastCandidateWatcher(
+        cache, ShadowExecutionEngine(portfolio),
+        events_path=tmp_path / "candidate_events.jsonl",
+        score_history_path=tmp_path / "scores.jsonl",
+        scorer=HighScore(), pre_execution_refresher=FailedRefresh(),
+    )
+
+    watcher.tick()
+    assert not portfolio.has_symbol("NEW")
+    assert not portfolio.has_symbol("ACME")
+    assert portfolio.snapshot().closed_positions[0].exit_reason == "STOP_HIT"
+    assert "PRE_EXECUTION_REFRESH_FAILED:TimeoutError" in (
+        tmp_path / "candidate_events.jsonl"
+    ).read_text()
+
+
+def test_both_fast_watchers_continue_while_slow_llm_is_blocked(tmp_path):
+    entered, release = Event(), Event()
+
+    class SlowReasoning:
+        def reason(self, payload, *, expected_symbols, now):
+            entered.set()
+            assert release.wait(2)
+            return LlmReasoningResult(
+                status="UNAVAILABLE", candidates=(),
+                trace=ReasoningTrace(
+                    "FAKE", "gpt-5.6-sol", now.isoformat(), 1, 1,
+                    "1", "1", "FAILED", "TEST_DONE",
+                ),
+                failure_reason="TEST_DONE",
+            )
+
+    slow = EventDrivenReasoningProvider(SlowReasoning())
+    thread = Thread(target=lambda: slow.reason(
+        {"broad_market_context": {}, "candidates": [{"symbol": "NEW"}]},
+        expected_symbols=["NEW"], now=NOW,
+    ))
+    thread.start()
+    assert entered.wait(1)
+
+    watcher, portfolio, _engine, position, _provider = setup_watcher(
+        tmp_path, Quotes(101)
+    )
+    cache = CandidateContextStore(tmp_path / "candidates.json")
+    candidate = candidate_context(slow=.6, at=NOW)
+    candidate.symbol = "NEW"
+    cache.replace([candidate], now=NOW)
+
+    class LowScore:
+        def score(self, context, quote):
+            return LiveScore(.1, {"fixture": {"value": .1, "weight": 1}})
+
+    watcher.candidate_watcher = FastCandidateWatcher(
+        cache, ShadowExecutionEngine(portfolio),
+        events_path=tmp_path / "candidate_events.jsonl",
+        score_history_path=tmp_path / "scores.jsonl", scorer=LowScore(),
+    )
+    watcher.tick()
+    release.set()
+    thread.join(2)
+    assert position.last_price_timestamp == NOW.isoformat()
+    assert cache.snapshot()[0].last_updated_at == NOW.isoformat()
+    assert not thread.is_alive()
 
 
 def test_idle_then_new_position_activates_batch(tmp_path):

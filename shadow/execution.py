@@ -128,6 +128,9 @@ class ShadowExecutionEngine:
         """Apply local fill mechanics without changing the risk-sized quantity."""
 
         symbol = plan.symbol
+        if any(p.episode_id == plan.episode_id or p.trade_id == plan.trade_id
+               for p in [*self.portfolio.state.open_positions, *self.portfolio.state.closed_positions]):
+            return None, {'symbol': symbol, 'reason': 'EPISODE_ALREADY_EXECUTED'}
         if self.market_closing(now):
             return None, {"symbol": symbol, "reason": "MARKET_CLOSING"}
         if self.portfolio.has_symbol(symbol):
@@ -144,26 +147,24 @@ class ShadowExecutionEngine:
             max(plan.entry_price, ask) if ask is not None and ask > 0
             else plan.entry_price
         )
-        fill = reference_fill * (1 + config.SHADOW_ENTRY_SLIPPAGE_BPS / 10_000)
+        is_scalp = plan.strategy in {'SCALP', config.SCALP_STRATEGY_ID}
+        entry_slippage_bps = config.SCALP_ENTRY_SLIPPAGE_BPS if is_scalp else config.SHADOW_ENTRY_SLIPPAGE_BPS
+        fill = reference_fill * (1 + entry_slippage_bps / 10_000)
         risk_per_share = fill - plan.stop_price
         risk_reward = (
             (plan.target_price - fill) / risk_per_share if risk_per_share > 0 else 0
         )
-        if risk_reward < config.MIN_RISK_REWARD_RATIO:
+        minimum_rr = config.SCALP_MIN_RISK_REWARD if is_scalp else config.MIN_RISK_REWARD_RATIO
+        if risk_reward < minimum_rr:
             return None, {"symbol": symbol, "reason": "LOW_RISK_REWARD"}
-        result = self.risk_manager.evaluate(
-            RiskRequest(
-                account_equity=self.portfolio.state.equity,
-                entry_price=fill,
-                stop_price=plan.stop_price,
-                daily_realized_pnl=self.portfolio.state.daily_pnl,
-                open_positions=len(self.portfolio.state.open_positions),
-                trades_today=self.portfolio.state.trades_today,
-                available_buying_power=self.portfolio.state.cash,
-                requested_shares=plan.quantity,
-            )
-        )
-        if not result.approved:
+        from trading_runtime.portfolio_controller import PortfolioController
+        from trading_runtime.journal import RuntimeEvent, RuntimeEventType
+        from dataclasses import asdict
+        decision, result = PortfolioController(self.portfolio, self.risk_manager).evaluate(plan, fill)
+        self.portfolio.journal.append(RuntimeEvent(
+            RuntimeEventType.PORTFOLIO_APPROVED if decision.approved else RuntimeEventType.PORTFOLIO_REJECTED,
+            now.isoformat(), symbol, plan.episode_id, plan.research_cycle_id, asdict(decision)))
+        if not decision.approved:
             reason_text = " ".join(result.reasons).lower()
             code = (
                 "MAX_POSITIONS" if "simultaneous" in reason_text
@@ -172,6 +173,16 @@ class ShadowExecutionEngine:
                 else "RISK_REJECTED"
             )
             return None, {"symbol": symbol, "reason": code, "details": list(result.reasons)}
+
+        from rl.actions import EntryAction
+        from rl.safety import SafetyOverride
+        from trading_runtime.contracts import MarketSnapshot
+        safety = SafetyOverride.evaluate(
+            EntryAction.ENTER, target='SHADOW', risk=result, portfolio=decision,
+            market_snapshot=MarketSnapshot.from_mapping(
+                candidate_data, now=now, max_age=config.PRE_EXECUTION_MAX_QUOTE_AGE_SECONDS))
+        if not safety.approved:
+            return None, {"symbol": symbol, "reason": "SAFETY_OVERRIDE:" + ','.join(safety.reasons)}
 
         news = plan.news_context
         sector = plan.sector_context
@@ -183,6 +194,8 @@ class ShadowExecutionEngine:
             if isinstance(item, Mapping) and item.get("event_id")
         ] if isinstance(news, Mapping) else []
         position = ShadowPosition(
+            episode_id=plan.episode_id, research_cycle_id=plan.research_cycle_id,
+            entry_intent_id=plan.entry_intent_id,
             trade_id=plan.trade_id, symbol=symbol, direction="LONG",
             strategy=plan.strategy, entry_price=round(fill, 4),
             requested_entry_price=plan.entry_price,
@@ -203,6 +216,14 @@ class ShadowExecutionEngine:
             market_regime=str(market.get("regime", "UNKNOWN")) if isinstance(market, Mapping) else "UNKNOWN",
             news_event_ids_at_entry=event_ids, last_price=round(fill, 4),
             estimated_entry_slippage_cost=round((fill - reference_fill) * plan.quantity, 4),
+            strategy_id='SCALP' if is_scalp else 'MOMENTUM',
+            risk_allocated=round(risk_per_share * plan.quantity, 4),
+            capital_allocated=round(fill * plan.quantity, 4),
+            quoted_entry_bid=_number(candidate_data.get('bid')),
+            quoted_entry_ask=ask,
+            estimated_spread_cost=round(
+                max(0, (ask-(_number(candidate_data.get('bid')) or ask))) * plan.quantity
+                if ask else 0, 4),
             thesis=plan.thesis or None,
             invalidation_condition=plan.invalidation_condition or None,
             technical_context=dict(technical) if isinstance(technical, Mapping) else {},
@@ -256,6 +277,22 @@ class ShadowExecutionEngine:
             if current is None or quote_age is None or quote_age < -30 or quote_age > config.MAX_QUOTE_AGE_SECONDS:
                 warnings.append(f"{position.symbol}: fresh shadow-position price unavailable")
                 evaluated.append({"symbol": position.symbol, "status": "OPEN", "reason": "STALE_DATA"})
+                continue
+            entry_at = _timestamp(position.entry_timestamp)
+            carried = entry_at is not None and entry_at.astimezone(ZoneInfo(config.MARKET_TIMEZONE)).date() < now.astimezone(ZoneInfo(config.MARKET_TIMEZONE)).date()
+            if carried or self.market_closing(now):
+                position.quote_source = 'PERIODIC_ROBINHOOD_SNAPSHOT'
+                position.last_price_timestamp = quote_time.isoformat()
+                # An overdue intraday position exits at the available fresh
+                # mark, before retrospective bars can relabel it as a winner.
+                trade = self.close_at_price(
+                    position.trade_id, current, 'MISSED_EOD_RECOVERY_EXIT' if carried else 'END_OF_DAY_EXIT', now=now,
+                    exit_method='SLOW_SNAPSHOT_EXIT',
+                    warnings=['MISSED_EOD_MONITORING_WINDOW: recovered at first fresh mark'] if carried else [],
+                )
+                evaluated.append({'symbol': position.symbol, 'status': 'MISSED_EOD_RECOVERY_EXIT' if carried else 'END_OF_DAY_EXIT'})
+                if trade is not None:
+                    exited.append(trade.to_dict())
                 continue
             if not fast_owns:
                 marks[position.symbol] = current
@@ -398,9 +435,16 @@ class ShadowExecutionEngine:
         position = next((p for p in self.portfolio.state.open_positions if p.trade_id == trade_id), None)
         if position is None:
             return None
-        fill = round(base_exit * (1 - config.SHADOW_EXIT_SLIPPAGE_BPS / 10_000), 4)
+        is_scalp = position.strategy in {'SCALP', config.SCALP_STRATEGY_ID}
+        exit_slippage_bps = config.SCALP_EXIT_SLIPPAGE_BPS if is_scalp else config.SHADOW_EXIT_SLIPPAGE_BPS
+        fill = round(base_exit * (1 - exit_slippage_bps / 10_000), 4)
         net = (fill - position.entry_price) * position.quantity
+        holding_seconds = max(0, (now - (_timestamp(position.entry_timestamp) or now)).total_seconds())
+        exit_slippage_cost = (base_exit-fill)*position.quantity
         trade = ShadowTrade(
+            episode_id=position.episode_id, research_cycle_id=position.research_cycle_id,
+            entry_intent_id=position.entry_intent_id,
+            price_source=position.quote_source, quote_timestamp=position.last_price_timestamp,
             trade_id=position.trade_id, symbol=position.symbol, strategy=position.strategy,
             sector=position.sector, entry_timestamp=position.entry_timestamp,
             entry_price=position.entry_price, quantity=position.quantity,
@@ -410,7 +454,7 @@ class ShadowExecutionEngine:
             estimated_slippage_cost=round(position.estimated_entry_slippage_cost + (base_exit - fill) * position.quantity, 4),
             net_pnl=round(net, 4),
             return_percent=round(net / position.notional_value * 100, 4) if position.notional_value else 0,
-            holding_time_minutes=round(max(0, (now - (_timestamp(position.entry_timestamp) or now)).total_seconds() / 60), 2),
+            holding_time_minutes=round(holding_seconds / 60, 2),
             coordinator_confidence=position.coordinator_confidence, coordinator_score=position.coordinator_score,
             technical_score=position.technical_score, news_score=position.news_score,
             sector_score=position.sector_score, market_score=position.market_score,
@@ -433,6 +477,19 @@ class ShadowExecutionEngine:
                 "new_state": "CLOSED",
                 "reason": reason,
             }],
+            strategy_id=position.strategy_id,
+            risk_allocated=position.risk_allocated,
+            capital_allocated=position.capital_allocated,
+            quoted_entry_bid=position.quoted_entry_bid,
+            quoted_entry_ask=position.quoted_entry_ask,
+            quoted_exit_bid=position.current_bid,
+            quoted_exit_ask=position.current_ask,
+            estimated_spread_cost=position.estimated_spread_cost,
+            entry_slippage_cost=position.estimated_entry_slippage_cost,
+            exit_slippage_cost=round(exit_slippage_cost, 4),
+            holding_time_seconds=round(holding_seconds, 3),
+            maximum_favorable_excursion=position.maximum_favorable_excursion,
+            maximum_adverse_excursion=position.maximum_adverse_excursion,
         )
         self.portfolio.close_position(trade_id, trade)
         return trade

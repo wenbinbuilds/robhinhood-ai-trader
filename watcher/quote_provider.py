@@ -1,6 +1,7 @@
 """Safe quote boundary for snapshots and direct factual Robinhood reads."""
 import json
 import time
+from statistics import median
 from datetime import datetime, time as datetime_time, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -79,6 +80,7 @@ class RobinhoodDirectQuoteProvider:
 
     name = "DIRECT_ROBINHOOD_MCP"
     mode = "DIRECT_MCP_UNVALIDATED"
+    metrics_sample_limit = 25_000
 
     def __init__(self, client: DirectRobinhoodMcpClient, *, clock=None) -> None:
         self.client = client
@@ -89,6 +91,22 @@ class RobinhoodDirectQuoteProvider:
         self.max_latency = 0.0
         self.total_quote_age = 0.0
         self.quote_age_count = 0
+        self._latency_samples: list[float] = []
+        self._quote_age_samples: list[float] = []
+
+    @staticmethod
+    def _percentile(values: Sequence[float], percentile: float) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        index = (len(ordered) - 1) * percentile
+        low, high = int(index), min(int(index) + 1, len(ordered) - 1)
+        return ordered[low] + (ordered[high] - ordered[low]) * (index - low)
+
+    def _sample(self, values: list[float], item: float) -> None:
+        values.append(item)
+        if len(values) > self.metrics_sample_limit:
+            del values[: len(values) - self.metrics_sample_limit]
 
     @property
     def metrics(self) -> dict[str, float | int | bool | None]:
@@ -108,8 +126,12 @@ class RobinhoodDirectQuoteProvider:
             "failure_count": self.failure_count,
             "failure_rate": failure_rate,
             "average_latency_seconds": average_latency,
+            "median_latency_seconds": median(self._latency_samples) if self._latency_samples else None,
+            "p95_latency_seconds": self._percentile(self._latency_samples, 0.95),
             "max_latency_seconds": self.max_latency if self.request_count else None,
             "average_quote_age_seconds": average_age,
+            "median_quote_age_seconds": median(self._quote_age_samples) if self._quote_age_samples else None,
+            "p95_quote_age_seconds": self._percentile(self._quote_age_samples, 0.95),
             "suitable_for_configured_fast_watcher": suitable,
         }
 
@@ -135,6 +157,7 @@ class RobinhoodDirectQuoteProvider:
                 if age >= 0:
                     self.total_quote_age += age
                     self.quote_age_count += 1
+                    self._sample(self._quote_age_samples, age)
                 result[symbol] = FastQuote(
                     symbol=symbol,
                     bid=price(row.get("bid")),
@@ -153,3 +176,4 @@ class RobinhoodDirectQuoteProvider:
             elapsed = time.monotonic() - started
             self.total_latency += elapsed
             self.max_latency = max(self.max_latency, elapsed)
+            self._sample(self._latency_samples, elapsed)
