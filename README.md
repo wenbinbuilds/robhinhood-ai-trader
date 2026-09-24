@@ -1,12 +1,6 @@
 <p align="center">
-  <img src="assets/project-banner.svg" alt="Robinhood AI Trader placeholder project banner" width="900">
+  <img src="assets/project-banner.svg" alt="Robinhood AI Trader project banner" width="900">
 </p>
-
-> **Banner status:** The image above is a clearly marked placeholder. Create a
-> final 1600 × 400 px SVG or PNG at `assets/project-banner.svg` that includes
-> the project name, a simple market-data motif, and the words “Local Shadow
-> Trading.” Do not include account information or imply affiliation with
-> Robinhood.
 
 # Robinhood AI Trader
 

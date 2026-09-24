@@ -1,12 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="400" viewBox="0 0 1600 400" role="img" aria-labelledby="title desc">
-  <title id="title">Robinhood AI Trader placeholder banner</title>
-  <desc id="desc">A temporary navy and maize project banner marked as a placeholder for local shadow trading.</desc>
+  <title id="title">Robinhood AI Trader project banner</title>
+  <desc id="desc">A navy and maize project banner for a local research and shadow-trading system.</desc>
   <rect width="1600" height="400" fill="#00274C"/>
   <path d="M90 290 L250 230 L390 260 L560 145 L720 205 L890 120 L1060 175 L1240 90 L1510 135" fill="none" stroke="#FFCB05" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
   <g fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif">
     <text x="90" y="110" font-size="64" font-weight="700">Robinhood AI Trader</text>
     <text x="94" y="170" font-size="32">Local research and shadow trading</text>
   </g>
-  <rect x="90" y="315" width="620" height="52" rx="8" fill="#FFCB05"/>
-  <text x="115" y="351" fill="#00274C" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="700">PLACEHOLDER — REPLACE WITH FINAL BANNER</text>
 </svg>
