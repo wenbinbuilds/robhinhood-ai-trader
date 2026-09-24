@@ -52,6 +52,11 @@ INFRASTRUCTURE_REASONS = {
     "REFRESHED_EXCHANGE_TIMESTAMP_MISSING_OR_INVALID",
 }
 
+LEGACY_POSITION_WEIGHTS = {
+    "technical": 0.35, "news": 0.20, "sector": 0.10,
+    "market": 0.10, "qualitative": 0.25,
+}
+
 
 def _number(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
@@ -119,16 +124,31 @@ def _percentile(values: Sequence[float], percentile: float) -> float | None:
     return round(ordered[low] + (ordered[high] - ordered[low]) * (position - low), 6)
 
 
-def _distribution(values: Iterable[Any]) -> dict[str, Any]:
+def _distribution(
+    values: Iterable[Any], thresholds: Sequence[float] = (),
+) -> dict[str, Any]:
     numbers = [item for value in values if (item := _number(value)) is not None]
     return {
         "count": len(numbers),
         "mean": round(mean(numbers), 6) if numbers else None,
         "median": round(median(numbers), 6) if numbers else None,
+        "p10": _percentile(numbers, 0.10),
         "p25": _percentile(numbers, 0.25),
         "p75": _percentile(numbers, 0.75),
+        "p90": _percentile(numbers, 0.90),
+        "p95": _percentile(numbers, 0.95),
         "minimum": round(min(numbers), 6) if numbers else None,
         "maximum": round(max(numbers), 6) if numbers else None,
+        "thresholds": {
+            f"at_or_above_{threshold:.2f}": {
+                "count": sum(value >= threshold for value in numbers),
+                "percent": (
+                    round(100 * sum(value >= threshold for value in numbers) / len(numbers), 3)
+                    if numbers else None
+                ),
+            }
+            for threshold in thresholds
+        },
     }
 
 
@@ -394,6 +414,8 @@ class ShadowSessionAudit:
         technical_scores: list[float] = []
         qualitative_scores: list[float] = []
         slow_scores: list[float] = []
+        calibrated_scores: list[float] = []
+        score_reconstructions: list[dict[str, Any]] = []
         warning_combinations: Counter[str] = Counter()
         score_and_warnings: list[tuple[float, set[str]]] = []
         unique_opportunities = len(analyzed)
@@ -418,6 +440,40 @@ class ShadowSessionAudit:
             dynamic = _number(row.get("dynamic_score"))
             technical = _number(coordinator.get("technical_score"))
             qualitative = _number(coordinator.get("qualitative_score"))
+            components = {
+                name: _number(coordinator.get(f"{name}_score"))
+                for name in ("technical", "news", "sector", "market", "qualitative")
+            }
+            if all(value is not None for value in components.values()):
+                recalibrated = sum(
+                    float(components[name]) * config.COORDINATOR_WEIGHTS[name]
+                    for name in config.COORDINATOR_WEIGHTS
+                )
+                legacy = sum(
+                    float(components[name]) * LEGACY_POSITION_WEIGHTS[name]
+                    for name in LEGACY_POSITION_WEIGHTS
+                )
+                calibrated_scores.append(recalibrated)
+                score_reconstructions.append({
+                    "symbol": row.get("symbol"),
+                    "logged_combined_score": slow,
+                    "legacy_reconstructed_score": round(legacy, 6),
+                    "calibrated_replay_score": round(recalibrated, 6),
+                    "components": {
+                        name: {
+                            "value": components[name],
+                            "legacy_weight": LEGACY_POSITION_WEIGHTS[name],
+                            "legacy_contribution": round(
+                                float(components[name]) * LEGACY_POSITION_WEIGHTS[name], 6
+                            ),
+                            "production_weight": config.COORDINATOR_WEIGHTS[name],
+                            "production_contribution": round(
+                                float(components[name]) * config.COORDINATOR_WEIGHTS[name], 6
+                            ),
+                        }
+                        for name in components
+                    },
+                })
             if technical is not None:
                 technical_scores.append(technical)
             if qualitative is not None:
@@ -532,9 +588,29 @@ class ShadowSessionAudit:
             "geometry_examples": geometry_examples,
             "slow_score_buckets": slow_buckets,
             "scores": {
-                "slow": _distribution(slow_scores),
-                "qualitative": _distribution(qualitative_scores),
-                "technical": _distribution(technical_scores),
+                "logged_legacy_combined": _distribution(
+                    slow_scores, (.40, .50, .60, .65, .70, .72, .75)
+                ),
+                "calibrated_replay_combined": _distribution(
+                    calibrated_scores, (.40, .50, .60, .65, .70, .72, .75)
+                ),
+                # Compatibility alias for existing report consumers.
+                "slow": _distribution(
+                    slow_scores, (.40, .50, .60, .65, .70, .72, .75)
+                ),
+                "qualitative": _distribution(
+                    qualitative_scores, (.40, .50, .60, .65, .70, .72, .75)
+                ),
+                "technical": _distribution(
+                    technical_scores, (.40, .50, .60, .65, .70, .72, .75)
+                ),
+                "formula": {
+                    "legacy_logged_weights": LEGACY_POSITION_WEIGHTS,
+                    "production_weights": dict(config.COORDINATOR_WEIGHTS),
+                    "neutral_context_value": 0.5,
+                    "missing_qualitative_behavior": "neutral_score_plus_fail_closed_veto",
+                },
+                "reconstructions": score_reconstructions,
             },
             "soft_warning_combinations": dict(warning_combinations.most_common()),
             "soft_warning_effects": warning_effects,

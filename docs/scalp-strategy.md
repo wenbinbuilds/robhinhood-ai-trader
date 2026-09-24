@@ -9,11 +9,13 @@
    reconciliation and restart recovery.
 
 2. **Momentum separation.** The original momentum pipeline is unchanged. The
-   scalp universe comes from the latest scanner `candidate_data` snapshot rather
-   than momentum watchlist admission. Optional slow context only fills missing
-   background fields and cannot make quotes or bars fresh. The scalp package has
-   no LLM/reasoning imports. A lazy `agent` package export compatibility fix
-   prevents strategy imports from initializing the slow market-cycle graph.
+   scalp universe now has dedicated `scalp_candidate_data` built from a bounded
+   liquid-equity seed plus the deduplicated shared active universe; it does not
+   require momentum scanner or watchlist admission. Optional slow context only
+   fills missing background fields and cannot make quotes or bars fresh. The
+   scalp package has no LLM/reasoning imports. A lazy `agent` package export
+   compatibility fix prevents strategy imports from initializing the slow
+   market-cycle graph.
 
 3. **Setup types.** Deterministic labels are MICRO_BREAKOUT, VWAP_RECLAIM,
    EMA9_CONTINUATION, MICRO_PULLBACK, MOMENTUM_BURST and UNCLASSIFIED. Evidence,
@@ -122,7 +124,7 @@
     fast watcher strategy dispatch and lazy analysis exports. Shared fill changes
     branch on strategy ID; momentum still uses its original slippage and RR.
 
-22. **Verification.** Full suite: **442 passed**. Tests cover disabled behavior,
+22. **Verification.** Full suite: **450 passed**. Tests cover disabled behavior,
     absence of LLM dependencies, quote/bar freshness, spread and edge gates,
     realistic fills/costs, mandatory/target/time/momentum/EOD/profit exits,
     structural re-entry, overtrading/loss limits, coexistence/attribution,
@@ -152,8 +154,10 @@
 python runner.py --scalp-status
 python runner.py --scalp-summary
 python runner.py --scalp-backtest --scalp-input historical.jsonl
+python runner.py --loop --scalp-shadow
 ```
 
-There is no live scalp command. The repository currently has zero scalp trades,
+`--scalp-shadow` is a process-local shadow-only override and does not edit the
+disabled default. There is no live scalp command. The repository currently has zero scalp trades,
 so no profitability or real disagreement claim is made. The milestone delivered
 correct simulation, safety, attribution and instrumentation—not maximum frequency.

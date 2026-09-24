@@ -2,7 +2,7 @@
 import json
 import time
 from statistics import median
-from datetime import datetime, time as datetime_time, timezone
+from datetime import datetime, timedelta, time as datetime_time, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Mapping, Protocol, Sequence
@@ -34,8 +34,10 @@ class SnapshotQuoteProvider:
     def __init__(self, path: str | Path):
         self.path = Path(path)
 
-    def get_quotes(self, symbols: Sequence[str]) -> Mapping[str, FastQuote]:
+    def get_quotes(self, symbols: Sequence[str], *, poll_cycle_id=None) -> Mapping[str, FastQuote]:
+        request_started = datetime.now(timezone.utc)
         value = json.loads(self.path.read_text(encoding="utf-8"))
+        request_finished = datetime.now(timezone.utc)
         if (not isinstance(value, dict) or value.get("data_source") != "ROBINHOOD_MCP"
                 or value.get("mcp_status") != "CONNECTED"
                 or timestamp(value.get("generated_at")) is None):
@@ -47,8 +49,9 @@ class SnapshotQuoteProvider:
         if not isinstance(is_open, bool):
             is_open = None
         result = {}
+        generated_at = timestamp(value.get('generated_at'))
         # Shadow-specific rows take precedence over scanner candidates.
-        for section in ("candidate_data", "shadow_position_data"):
+        for section in ("candidate_data", "scalp_candidate_data", "shadow_position_data"):
             rows = value.get(section, [])
             if not isinstance(rows, list):
                 raise ValueError("invalid quote rows")
@@ -63,6 +66,18 @@ class SnapshotQuoteProvider:
                     last_price=price(row.get("current_price")), timestamp=at,
                     source=self.name, is_market_open=is_open,
                     session_close=timestamp(market.get("closes_at")),
+                    received_at=request_finished,
+                    request_started_at=request_started,
+                    request_finished_at=request_finished,
+                    provider_latency_seconds=(request_finished-request_started).total_seconds(),
+                    provider_status='OK', cache_hit=True,
+                    cache_key=str(self.path.resolve()),
+                    cache_created_at=generated_at,
+                    cache_expiry=(
+                        generated_at + timedelta(seconds=config.SNAPSHOT_MAX_AGE_SECONDS)
+                        if generated_at else None
+                    ),
+                    poll_cycle_id=poll_cycle_id,
                 )
                 old = result.get(quote.symbol)
                 if old is None or old.timestamp <= at:
@@ -93,6 +108,7 @@ class RobinhoodDirectQuoteProvider:
         self.quote_age_count = 0
         self._latency_samples: list[float] = []
         self._quote_age_samples: list[float] = []
+        self.last_request_trace: dict[str, dict[str, object]] = {}
 
     @staticmethod
     def _percentile(values: Sequence[float], percentile: float) -> float | None:
@@ -135,7 +151,10 @@ class RobinhoodDirectQuoteProvider:
             "suitable_for_configured_fast_watcher": suitable,
         }
 
-    def get_quotes(self, symbols: Sequence[str]) -> Mapping[str, FastQuote]:
+    def get_quotes(self, symbols: Sequence[str], *, poll_cycle_id=None) -> Mapping[str, FastQuote]:
+        request_started_at = self.clock()
+        if request_started_at.tzinfo is None:
+            request_started_at = request_started_at.replace(tzinfo=timezone.utc)
         started = time.monotonic()
         self.request_count += 1
         try:
@@ -144,6 +163,7 @@ class RobinhoodDirectQuoteProvider:
             if received.tzinfo is None:
                 received = received.replace(tzinfo=timezone.utc)
             raw = normalized_quotes(call.value, symbols, retrieved_at=received)
+            provider_latency = time.monotonic() - started
             _status, is_open, _source = regular_session(received)
             local = received.astimezone(ZoneInfo(config.MARKET_TIMEZONE))
             close_time = early_close(local.date()) or datetime_time(*config.REGULAR_MARKET_CLOSE)
@@ -167,7 +187,23 @@ class RobinhoodDirectQuoteProvider:
                     source=self.name,
                     is_market_open=is_open,
                     session_close=session_close,
+                    received_at=received,
+                    request_started_at=request_started_at,
+                    request_finished_at=received,
+                    provider_latency_seconds=provider_latency,
+                    provider_status='OK', cache_hit=False,
+                    cache_key=None, cache_created_at=None, cache_expiry=None,
+                    poll_cycle_id=poll_cycle_id,
                 )
+            self.last_request_trace = {
+                symbol: quote_provenance(
+                    result.get(symbol), symbol=symbol,
+                    evaluation_at=received, maximum_age_seconds=None,
+                    provider_status=('OK' if symbol in result else 'NO_QUOTE'),
+                    poll_cycle_id=poll_cycle_id,
+                )
+                for symbol in symbols
+            }
             return result
         except Exception:
             self.failure_count += 1
@@ -177,3 +213,102 @@ class RobinhoodDirectQuoteProvider:
             self.total_latency += elapsed
             self.max_latency = max(self.max_latency, elapsed)
             self._sample(self._latency_samples, elapsed)
+
+
+def quote_provenance(
+    quote: FastQuote | None, *, symbol: str, evaluation_at: datetime,
+    maximum_age_seconds: float | None, provider_status: str,
+    poll_cycle_id: str | None = None, previous_exchange_timestamp: datetime | None = None,
+    requested_this_cycle: bool = True,
+) -> dict[str, object]:
+    """Explain quote age without treating provider success as freshness."""
+
+    evaluated = evaluation_at.astimezone(timezone.utc)
+    if quote is None:
+        return {
+            'symbol': symbol.upper(), 'poll_cycle_id': poll_cycle_id,
+            'request_started_at': None, 'request_finished_at': None,
+            'provider_latency_ms': None,
+            'provider_status': provider_status,
+            'exchange_timestamp': None, 'received_timestamp': None,
+            'evaluation_timestamp': evaluated.isoformat(),
+            'exchange_quote_age_seconds': None,
+            'exchange_quote_age_at_receive_seconds': None,
+            'local_cache_age_seconds': None,
+            'stale_reason': (
+                'QUOTE_NOT_POLLED_THIS_CYCLE' if not requested_this_cycle
+                else 'SYMBOL_NOT_REFRESHED' if provider_status in {'OK', 'NO_QUOTE'}
+                else 'UNKNOWN'
+            ),
+            'requested_this_cycle': requested_this_cycle,
+            'cache_hit': False, 'cache_key': None,
+            'cache_created_at': None, 'cache_expiry': None,
+            'quote_source': None, 'bid': None, 'ask': None, 'mid': None,
+            'spread_pct': None,
+            'freshness_threshold_seconds': maximum_age_seconds,
+            'exchange_timestamp_changed': None,
+        }
+    received = quote.received_at or quote.request_finished_at or evaluated
+    received = received.astimezone(timezone.utc)
+    exchange_at = quote.timestamp.astimezone(timezone.utc)
+    exchange_age_at_receive = (received-exchange_at).total_seconds()
+    exchange_age_at_evaluation = (evaluated-exchange_at).total_seconds()
+    local_age = (
+        (evaluated-quote.cache_created_at.astimezone(timezone.utc)).total_seconds()
+        if quote.cache_hit and quote.cache_created_at is not None
+        else 0.0 if quote.cache_hit else (evaluated-received).total_seconds()
+    )
+    stale = (
+        maximum_age_seconds is not None
+        and exchange_age_at_evaluation > maximum_age_seconds
+    )
+    reason = None
+    if stale and quote.cache_hit:
+        reason = 'LOCAL_CACHE_REUSE'
+    elif (stale and quote.request_started_at is not None
+          and exchange_at >= quote.request_started_at.astimezone(timezone.utc)
+          and (quote.provider_latency_seconds or 0) > (maximum_age_seconds or 0)):
+        reason = 'PROVIDER_REQUEST_DELAY'
+    elif stale and exchange_age_at_receive > (maximum_age_seconds or 0):
+        reason = 'PROVIDER_RETURNED_OLD_EXCHANGE_TIMESTAMP'
+    elif stale and local_age > 0:
+        reason = 'BATCH_REFRESH_DELAY'
+    elif stale:
+        reason = 'UNKNOWN'
+    bid, ask = quote.bid, quote.ask
+    mid = ((bid+ask)/2 if bid is not None and ask is not None and ask >= bid else None)
+    spread = ((ask-bid)/mid if mid else None)
+    return {
+        'symbol': symbol.upper(),
+        'poll_cycle_id': poll_cycle_id or quote.poll_cycle_id,
+        'requested_this_cycle': requested_this_cycle,
+        'request_started_at': (quote.request_started_at.isoformat()
+                               if quote.request_started_at else None),
+        'request_finished_at': (quote.request_finished_at.isoformat()
+                                if quote.request_finished_at else None),
+        'provider_latency_ms': (
+            quote.provider_latency_seconds*1000
+            if quote.provider_latency_seconds is not None else None
+        ),
+        'provider_status': provider_status,
+        'exchange_timestamp': exchange_at.isoformat(),
+        'received_timestamp': received.isoformat(),
+        'evaluation_timestamp': evaluated.isoformat(),
+        'exchange_quote_age_seconds': exchange_age_at_evaluation,
+        'exchange_quote_age_at_receive_seconds': exchange_age_at_receive,
+        'local_cache_age_seconds': local_age if quote.cache_hit else 0.0,
+        'cache_hit': quote.cache_hit,
+        'cache_key': quote.cache_key,
+        'cache_created_at': (quote.cache_created_at.isoformat()
+                             if quote.cache_created_at else None),
+        'cache_expiry': (quote.cache_expiry.isoformat()
+                         if quote.cache_expiry else None),
+        'quote_source': quote.source,
+        'bid': bid, 'ask': ask, 'mid': mid, 'spread_pct': spread,
+        'freshness_threshold_seconds': maximum_age_seconds,
+        'stale_reason': reason,
+        'exchange_timestamp_changed': (
+            exchange_at > previous_exchange_timestamp
+            if previous_exchange_timestamp is not None else None
+        ),
+    }

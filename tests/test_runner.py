@@ -88,6 +88,64 @@ def test_unknown_mode_fails_closed(monkeypatch: Any) -> None:
     assert runner.main(["--once"]) == 2
 
 
+def test_scalp_shadow_override_is_loop_only_and_does_not_change_default(monkeypatch, tmp_path):
+    assert runner.main(["--once", "--scalp-shadow"]) == 2
+    monkeypatch.setattr(config, "LIVE_TRADING_ENABLED", True)
+    assert runner.main(["--loop", "--scalp-shadow"]) == 2
+    assert config.SCALP_ENABLED is False
+
+
+def test_scalp_status_reports_discovery_limits_and_safety(tmp_path, capsys):
+    assert runner.main(["--scalp-status"]) == 0
+    payload = __import__('json').loads(capsys.readouterr().out)
+    assert payload["enabled"] is False
+    assert payload["candidate_discovery_source"] == config.SCALP_DISCOVERY_SOURCE
+    assert payload["max_quote_age_seconds"] == config.SCALP_MAX_QUOTE_AGE_SECONDS
+    assert payload["max_trades_per_symbol"] == config.SCALP_MAX_TRADES_PER_SYMBOL
+    assert payload["diagnostics_path"] == config.SCALP_DIAGNOSTICS_PATH
+    assert payload["debug_runtime_override"].endswith("--scalp-debug")
+    assert payload["safety"]["trading_blocked"] is True
+    assert payload["live_supported"] is False
+
+
+def test_scalp_debug_requires_enabled_shadow_loop(capsys):
+    assert runner.main(["--loop", "--scalp-debug"]) == 2
+    assert "requires an enabled shadow scalp --loop" in capsys.readouterr().err
+
+
+def test_scalp_summary_includes_observation_funnel_without_refresh(monkeypatch, capsys):
+    monkeypatch.setattr(
+        runner, "refresh_and_run", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError())
+    )
+    assert runner.main(["--scalp-summary"]) == 0
+    payload = __import__('json').loads(capsys.readouterr().out)
+    assert payload['session']['candidate_observations'] == 0
+    assert 'rates' in payload['session']
+    assert payload['performance']['strategy_id'] == 'SCALP'
+
+
+def test_loop_scalp_shadow_override_reaches_runtime_without_changing_config(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setattr(config, "ROBINHOOD_DATA_PROVIDER", "LEGACY_CODEX_MCP")
+    monkeypatch.setattr(config, "FAST_WATCHER_ENABLED", False)
+    calls = []
+
+    def failed_cycle(snapshot, portfolio=None, **kwargs):
+        calls.append(kwargs.get("scalp_enabled"))
+        return 3, None
+
+    monkeypatch.setattr(runner, "refresh_and_run", failed_cycle)
+    assert runner.main([
+        "--loop", "--scalp-shadow", "--snapshot", str(tmp_path/'snapshot.json')
+    ]) == 3
+    assert calls == [True]
+    assert config.SCALP_ENABLED is False
+    output = capsys.readouterr().out
+    assert "TRADER — SHADOW MODE" in output
+    assert "SHADOW ONLY" in output and "LIVE EXECUTION BLOCKED" in output
+
+
 def test_status_has_no_side_effects(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(runner, "refresh_and_run", lambda *_: (_ for _ in ()).throw(AssertionError()))
     assert runner.main(["--shadow-status"]) == 0

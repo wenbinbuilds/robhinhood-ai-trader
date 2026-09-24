@@ -102,6 +102,95 @@ def test_expected_move_must_exceed_friction(monkeypatch):
     assert signal.evaluate('e', 'ACME', quote(), market_data(), now=NOW).approved
 
 
+def test_strong_scalp_production_path_exceeds_threshold_and_enters_shadow(
+    tmp_path, monkeypatch
+):
+    decision = ScalpSignalEngine().evaluate(
+        'reachable', 'ACME', quote(), market_data(), now=NOW
+    )
+    assert decision.signal_score >= config.SCALP_MIN_SIGNAL_SCORE
+    assert sum(
+        component['contribution']
+        for component in decision.features.score_breakdown.values()
+    ) == pytest.approx(decision.signal_score)
+    entry, portfolio = controller(tmp_path, monkeypatch)
+    position, detail = entry.process('ACME', quote(), market_data(), now=NOW)
+    assert position is not None
+    assert detail['status'] == 'OPENED'
+    assert portfolio.snapshot().open_positions[0].strategy_id == 'SCALP'
+
+
+def test_micro_breakout_extension_audit_distinguishes_trigger_from_production_reference():
+    decision = ScalpSignalEngine().evaluate(
+        'audit', 'ACME', quote(), market_data(), now=NOW
+    )
+    audit = decision.features.entry_extension_reference
+    assert decision.setup_type == 'MICRO_BREAKOUT'
+    assert audit['production_reference_type'] == 'EMA9'
+    assert audit['production_reference_price'] == 100
+    assert audit['structural_reference_type'] == 'PRIOR_COMPLETED_MICRO_HIGH'
+    assert audit['structural_reference_price'] == pytest.approx(100.02)
+    assert audit['production_matches_structural_reference'] is False
+
+
+def test_ema9_continuation_extension_reference_is_structurally_aligned():
+    data = market_data()
+    for bar in data['candles']:
+        bar['high'] = 101.5  # prevent MICRO_BREAKOUT from taking precedence
+    decision = ScalpSignalEngine().evaluate('audit', 'ACME', quote(), data, now=NOW)
+    audit = decision.features.entry_extension_reference
+    assert decision.setup_type == 'EMA9_CONTINUATION'
+    assert audit['production_reference_type'] == audit['structural_reference_type'] == 'EMA9'
+    assert audit['production_matches_structural_reference'] is True
+
+
+def test_vwap_reclaim_extension_audit_exposes_generic_ema9_reference():
+    data = market_data()
+    data['vwap'] = 100.1
+    for bar in data['candles']:
+        bar['high'] = 101.5
+    decision = ScalpSignalEngine().evaluate('audit', 'ACME', quote(), data, now=NOW)
+    audit = decision.features.entry_extension_reference
+    assert decision.setup_type == 'VWAP_RECLAIM'
+    assert audit['production_reference_type'] == 'EMA9'
+    assert audit['structural_reference_type'] == 'VWAP'
+    assert audit['structural_reference_price'] == 100.1
+    assert audit['production_matches_structural_reference'] is False
+
+
+def test_extension_penalty_and_hard_gate_are_independent_protections():
+    decision = ScalpSignalEngine().evaluate(
+        'extended', 'ACME',
+        quote(bid=101, ask=101.04, last=101.02), market_data(), now=NOW,
+    )
+    penalty = decision.features.score_breakdown['entry_extension_penalty']
+    expected = min(1.0, max(0.0, (
+        decision.features.entry_extension - config.SCALP_MAX_EXTENSION_PCT
+    ) / config.SCALP_MAX_EXTENSION_PCT))
+    assert penalty['normalized'] == pytest.approx(expected)
+    assert penalty['contribution'] == pytest.approx(-.20 * expected)
+    assert decision.signal_score >= config.SCALP_MIN_SIGNAL_SCORE
+    assert 'ENTRY_OVEREXTENDED' in decision.rejection_reasons
+    assert decision.approved is False
+
+
+def test_valid_nonextended_entry_passes_unchanged_extension_guard():
+    decision = ScalpSignalEngine().evaluate(
+        'valid', 'ACME', quote(), market_data(), now=NOW
+    )
+    assert decision.features.entry_extension <= config.SCALP_MAX_EXTENSION_PCT
+    assert 'ENTRY_OVEREXTENDED' not in decision.rejection_reasons
+    assert decision.approved is True
+
+
+def test_volume_gate_name_is_not_execution_liquidity():
+    data = market_data()
+    data['relative_volume'] = 0.8
+    decision = ScalpSignalEngine().evaluate('e', 'ACME', quote(), data, now=NOW)
+    assert 'VOLUME_EXPANSION_BELOW_MINIMUM' in decision.rejection_reasons
+    assert 'INSUFFICIENT_LIQUIDITY' not in decision.rejection_reasons
+
+
 def test_entry_uses_ask_and_scalp_slippage(tmp_path, monkeypatch):
     _, _, position = opened(tmp_path, monkeypatch)
     expected = round(100.27*(1+config.SCALP_ENTRY_SLIPPAGE_BPS/10_000), 4)
@@ -219,7 +308,7 @@ def test_momentum_and_scalp_cannot_hold_same_symbol(tmp_path, monkeypatch):
     assert position is not None
     entry = ScalpEntryController(portfolio, setup_path=tmp_path/'s.json', events_path=tmp_path/'e.jsonl')
     scalp, detail = entry.process('ACME', quote(), market_data(), now=NOW)
-    assert scalp is None and detail['reason'] == 'DUPLICATE_POSITION'
+    assert scalp is None and detail['reason'] == 'EXISTING_POSITION_OTHER_STRATEGY'
     attribution = strategy_attribution(portfolio)
     assert attribution['MOMENTUM']['open_positions'] == 1
     assert attribution['SCALP']['open_positions'] == 0
@@ -284,15 +373,43 @@ def test_scalp_events_and_future_policy_boundary_are_strategy_aware(tmp_path, mo
     assert comparison.scalp_rl_action is None
 
 
-def test_scalp_universe_is_independent_of_momentum_admission(tmp_path):
+def test_scalp_universe_is_independent_of_momentum_admission(tmp_path, monkeypatch):
     from strategies.scalp.market_data import ScalpMarketDataCache
+    monkeypatch.setattr(config, 'SCALP_DISCOVERY_SYMBOLS', ())
     snapshot = tmp_path/'snapshot.json'
-    snapshot.write_text(json.dumps({'candidate_data': [
+    snapshot.write_text(json.dumps({'candidate_data': [], 'scalp_candidate_data': [
         {'symbol': 'SCALPONLY', 'candles': [], 'relative_volume': 2}
     ]}))
     cache = ScalpMarketDataCache(snapshot, context_store=None)
     assert cache.symbols() == ['SCALPONLY']
     assert cache.get('SCALPONLY')['relative_volume'] == 2
+
+
+def test_scalp_market_data_reads_are_immutable(tmp_path, monkeypatch):
+    from strategies.scalp.market_data import ScalpMarketDataCache
+    monkeypatch.setattr(config, 'SCALP_DISCOVERY_SYMBOLS', ())
+    snapshot = tmp_path/'snapshot.json'
+    snapshot.write_text(json.dumps({'candidate_data': [], 'scalp_candidate_data': [
+        {'symbol': 'ACME', 'candles': [{'close': 10}], 'relative_volume': 2}
+    ]}))
+    cache = ScalpMarketDataCache(snapshot)
+    first = cache.get('ACME')
+    first['candles'][0]['close'] = 999
+    assert cache.get('ACME')['candles'][0]['close'] == 10
+
+
+def test_runtime_override_enables_only_the_scalp_instance(tmp_path, monkeypatch):
+    from strategies.scalp.runtime import ScalpRuntime
+    monkeypatch.setattr(config, 'SCALP_ENABLED', False)
+    portfolio = ShadowPortfolio(tmp_path/'p.json', tmp_path/'t.jsonl')
+    runtime = ScalpRuntime(
+        portfolio, lambda _: market_data(), universe=lambda: ['ACME'],
+        setup_path=tmp_path/'s.json', events_path=tmp_path/'e.jsonl', enabled=True,
+    )
+    result = runtime.on_quotes({'ACME': quote()}, now=NOW)
+    assert result['diagnostics']['funnel']['universe_observations'] == 1
+    assert result['entries'][0]['status'] == 'OPENED'
+    assert config.SCALP_ENABLED is False
 
 
 def test_scalp_never_invokes_real_executor(tmp_path, monkeypatch):
@@ -303,3 +420,19 @@ def test_scalp_never_invokes_real_executor(tmp_path, monkeypatch):
     assert config.MODE == 'SHADOW_TRADING'
     assert config.LIVE_TRADING_ENABLED is False
     assert config.ROBINHOOD_EXECUTION_ENABLED is False
+
+
+def test_scalp_entry_blocks_if_live_flags_or_kill_switch_are_unsafe(tmp_path, monkeypatch):
+    entry, _ = controller(tmp_path/'flags', monkeypatch)
+    monkeypatch.setattr(config, 'LIVE_TRADING_ENABLED', True)
+    assert entry.process('ACME', quote(), market_data(), now=NOW)[1]['reason'] == 'SCALP_SAFETY_FLAGS_INVALID'
+
+    monkeypatch.setattr(config, 'LIVE_TRADING_ENABLED', False)
+    kill = tmp_path/'unblocked.json'
+    kill.write_text('{"trading_blocked": false}')
+    entry2 = ScalpEntryController(
+        ShadowPortfolio(tmp_path/'kill-p.json', tmp_path/'kill-t.jsonl'),
+        setup_path=tmp_path/'kill-s.json', events_path=tmp_path/'kill-e.jsonl',
+        enabled=True, kill_switch_path=kill,
+    )
+    assert entry2.process('ACME', quote(), market_data(), now=NOW)[1]['reason'] == 'SCALP_KILL_SWITCH_NOT_BLOCKED'

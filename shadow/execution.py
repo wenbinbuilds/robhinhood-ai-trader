@@ -13,6 +13,10 @@ from risk.risk_manager import RiskManager, RiskRequest
 from portfolio.construction import PortfolioConstructor
 from shadow.models import ShadowPosition, ShadowTrade
 from shadow.portfolio import ShadowPortfolio, synchronized
+from strategies.identity import (
+    POSITION_INTERNAL_ID, SCALP_INTERNAL_ID, is_scalp_strategy,
+    strategy_display_name,
+)
 
 
 def _number(value: Any) -> float | None:
@@ -48,6 +52,30 @@ class ShadowExecutionEngine:
         self.news_agent = news_agent or NewsAgent()
         self.portfolio_constructor = portfolio_constructor or PortfolioConstructor()
 
+    def _symbol_conflict(self, symbol: str, incoming_strategy: str) -> dict[str, Any] | None:
+        existing = next(
+            (item for item in self.portfolio.state.open_positions
+             if item.symbol == symbol.upper()),
+            None,
+        )
+        if existing is None:
+            return None
+        existing_name = strategy_display_name(
+            existing.strategy_id or existing.strategy
+        )
+        incoming_name = strategy_display_name(incoming_strategy)
+        cross_strategy = existing_name != incoming_name
+        return {
+            "symbol": symbol.upper(),
+            "reason": (
+                "EXISTING_POSITION_OTHER_STRATEGY"
+                if cross_strategy else "DUPLICATE_POSITION"
+            ),
+            "blocker": "BLOCKED_BY_EXISTING_POSITION",
+            "existing_strategy": existing_name,
+            "requested_strategy": incoming_name,
+        }
+
     @staticmethod
     def market_closing(now: datetime) -> bool:
         eastern = now.astimezone(ZoneInfo(config.MARKET_TIMEZONE))
@@ -68,8 +96,9 @@ class ShadowExecutionEngine:
             return None, {"symbol": symbol, "reason": "NOT_TRADE_CANDIDATE"}
         if self.market_closing(now):
             return None, {"symbol": symbol, "reason": "MARKET_CLOSING"}
-        if self.portfolio.has_symbol(symbol):
-            return None, {"symbol": symbol, "reason": "DUPLICATE_POSITION"}
+        conflict = self._symbol_conflict(symbol, POSITION_INTERNAL_ID)
+        if conflict:
+            return None, conflict
 
         entry = _number(coordinator.get("entry"))
         stop = _number(coordinator.get("stop"))
@@ -130,24 +159,32 @@ class ShadowExecutionEngine:
         symbol = plan.symbol
         if any(p.episode_id == plan.episode_id or p.trade_id == plan.trade_id
                for p in [*self.portfolio.state.open_positions, *self.portfolio.state.closed_positions]):
-            return None, {'symbol': symbol, 'reason': 'EPISODE_ALREADY_EXECUTED'}
+            return None, {'symbol': symbol, 'reason': 'EPISODE_ALREADY_EXECUTED',
+                          'pre_execution_passed': False,
+                          'portfolio_attempted': False}
         if self.market_closing(now):
-            return None, {"symbol": symbol, "reason": "MARKET_CLOSING"}
-        if self.portfolio.has_symbol(symbol):
-            return None, {"symbol": symbol, "reason": "DUPLICATE_POSITION"}
+            return None, {"symbol": symbol, "reason": "MARKET_CLOSING",
+                          'pre_execution_passed': False,
+                          'portfolio_attempted': False}
+        conflict = self._symbol_conflict(symbol, plan.strategy)
+        if conflict:
+            return None, {**conflict, 'pre_execution_passed': False,
+                          'portfolio_attempted': False}
         quote_time = _timestamp(candidate_data.get("quote_as_of"))
         quote_age = (
             (now.astimezone(timezone.utc) - quote_time).total_seconds()
             if quote_time is not None else None
         )
         if quote_age is None or quote_age < -30 or quote_age > config.MAX_QUOTE_AGE_SECONDS:
-            return None, {"symbol": symbol, "reason": "STALE_DATA"}
+            return None, {"symbol": symbol, "reason": "STALE_DATA",
+                          'pre_execution_passed': False,
+                          'portfolio_attempted': False}
         ask = _number(candidate_data.get("ask"))
         reference_fill = (
             max(plan.entry_price, ask) if ask is not None and ask > 0
             else plan.entry_price
         )
-        is_scalp = plan.strategy in {'SCALP', config.SCALP_STRATEGY_ID}
+        is_scalp = is_scalp_strategy(plan.strategy)
         entry_slippage_bps = config.SCALP_ENTRY_SLIPPAGE_BPS if is_scalp else config.SHADOW_ENTRY_SLIPPAGE_BPS
         fill = reference_fill * (1 + entry_slippage_bps / 10_000)
         risk_per_share = fill - plan.stop_price
@@ -156,7 +193,10 @@ class ShadowExecutionEngine:
         )
         minimum_rr = config.SCALP_MIN_RISK_REWARD if is_scalp else config.MIN_RISK_REWARD_RATIO
         if risk_reward < minimum_rr:
-            return None, {"symbol": symbol, "reason": "LOW_RISK_REWARD"}
+            return None, {"symbol": symbol, "reason": "LOW_RISK_REWARD",
+                          'pre_execution_passed': False,
+                          'portfolio_attempted': False,
+                          'fill_risk_reward_ratio': risk_reward}
         from trading_runtime.portfolio_controller import PortfolioController
         from trading_runtime.journal import RuntimeEvent, RuntimeEventType
         from dataclasses import asdict
@@ -172,7 +212,12 @@ class ShadowExecutionEngine:
                 else "DAILY_LOSS_LIMIT" if "daily loss" in reason_text
                 else "RISK_REJECTED"
             )
-            return None, {"symbol": symbol, "reason": code, "details": list(result.reasons)}
+            return None, {"symbol": symbol, "reason": code,
+                          "details": list(result.reasons),
+                          'pre_execution_passed': True,
+                          'portfolio_attempted': True,
+                          'portfolio_approved': False,
+                          'portfolio_reasons': list(decision.reasons)}
 
         from rl.actions import EntryAction
         from rl.safety import SafetyOverride
@@ -182,7 +227,12 @@ class ShadowExecutionEngine:
             market_snapshot=MarketSnapshot.from_mapping(
                 candidate_data, now=now, max_age=config.PRE_EXECUTION_MAX_QUOTE_AGE_SECONDS))
         if not safety.approved:
-            return None, {"symbol": symbol, "reason": "SAFETY_OVERRIDE:" + ','.join(safety.reasons)}
+            return None, {"symbol": symbol, "reason": "SAFETY_OVERRIDE:" + ','.join(safety.reasons),
+                          'pre_execution_passed': True,
+                          'portfolio_attempted': True,
+                          'portfolio_approved': True,
+                          'safety_approved': False,
+                          'safety_reasons': list(safety.reasons)}
 
         news = plan.news_context
         sector = plan.sector_context
@@ -216,7 +266,12 @@ class ShadowExecutionEngine:
             market_regime=str(market.get("regime", "UNKNOWN")) if isinstance(market, Mapping) else "UNKNOWN",
             news_event_ids_at_entry=event_ids, last_price=round(fill, 4),
             estimated_entry_slippage_cost=round((fill - reference_fill) * plan.quantity, 4),
-            strategy_id='SCALP' if is_scalp else 'MOMENTUM',
+            strategy_id=SCALP_INTERNAL_ID if is_scalp else POSITION_INTERNAL_ID,
+            strategy_display_name='SCALP' if is_scalp else 'POSITION',
+            entry_reason=(
+                str(technical.get('scalp_decision', {}).get('setup_type') or plan.thesis)
+                if is_scalp and isinstance(technical, Mapping) else plan.thesis
+            ),
             risk_allocated=round(risk_per_share * plan.quantity, 4),
             capital_allocated=round(fill * plan.quantity, 4),
             quoted_entry_bid=_number(candidate_data.get('bid')),
@@ -230,9 +285,24 @@ class ShadowExecutionEngine:
             news_context=dict(news) if isinstance(news, Mapping) else {},
             sector_context=dict(sector) if isinstance(sector, Mapping) else {},
             market_context=dict(market) if isinstance(market, Mapping) else {},
+            scalp_lifecycle_state='ACTIVE' if is_scalp else None,
+            scalp_lifecycle_updated_at=(now.astimezone(timezone.utc).isoformat()
+                                         if is_scalp else None),
+            scalp_max_hold_seconds=(config.SCALP_MAX_HOLD_SECONDS if is_scalp else None),
+            scalp_hold_seconds=(0.0 if is_scalp else None),
+            scalp_time_remaining_seconds=(float(config.SCALP_MAX_HOLD_SECONDS)
+                                          if is_scalp else None),
+            scalp_exit_status=('MONITORING' if is_scalp else None),
+            scalp_next_required_action=('MONITOR_POSITION' if is_scalp else None),
         )
         self.portfolio.add_position(position)
-        return position, {"symbol": symbol, "status": "OPENED", "risk": result.to_dict()}
+        return position, {"symbol": symbol, "status": "OPENED",
+                          "risk": result.to_dict(),
+                          'pre_execution_passed': True,
+                          'portfolio_attempted': True,
+                          'portfolio_approved': True,
+                          'safety_approved': True,
+                          'fill_risk_reward_ratio': risk_reward}
 
     def monitor_positions(
         self,
@@ -435,7 +505,7 @@ class ShadowExecutionEngine:
         position = next((p for p in self.portfolio.state.open_positions if p.trade_id == trade_id), None)
         if position is None:
             return None
-        is_scalp = position.strategy in {'SCALP', config.SCALP_STRATEGY_ID}
+        is_scalp = is_scalp_strategy(position.strategy_id or position.strategy)
         exit_slippage_bps = config.SCALP_EXIT_SLIPPAGE_BPS if is_scalp else config.SHADOW_EXIT_SLIPPAGE_BPS
         fill = round(base_exit * (1 - exit_slippage_bps / 10_000), 4)
         net = (fill - position.entry_price) * position.quantity
@@ -478,6 +548,8 @@ class ShadowExecutionEngine:
                 "reason": reason,
             }],
             strategy_id=position.strategy_id,
+            strategy_display_name=position.strategy_display_name,
+            entry_reason=position.entry_reason,
             risk_allocated=position.risk_allocated,
             capital_allocated=position.capital_allocated,
             quoted_entry_bid=position.quoted_entry_bid,
@@ -490,6 +562,23 @@ class ShadowExecutionEngine:
             holding_time_seconds=round(holding_seconds, 3),
             maximum_favorable_excursion=position.maximum_favorable_excursion,
             maximum_adverse_excursion=position.maximum_adverse_excursion,
+            configured_max_hold_seconds=(position.scalp_max_hold_seconds
+                                         if is_scalp else None),
+            crossed_max_hold_at=position.scalp_overdue_since if is_scalp else None,
+            exit_decision_at=(now.astimezone(timezone.utc).isoformat()
+                              if is_scalp and position.scalp_overdue_since else None),
+            max_hold_decision_delay_seconds=(
+                round(max(0.0, holding_seconds - float(
+                    position.scalp_max_hold_seconds or config.SCALP_MAX_HOLD_SECONDS)), 3)
+                if is_scalp and position.scalp_overdue_since else None
+            ),
+            max_hold_close_delay_seconds=(
+                round(max(0.0, holding_seconds - float(
+                    position.scalp_max_hold_seconds or config.SCALP_MAX_HOLD_SECONDS)), 3)
+                if is_scalp and position.scalp_overdue_since else None
+            ),
+            recovery_exit=reason == 'SCALP_RECOVERY_TIME_EXIT',
+            max_hold_delay_reasons=list(position.scalp_max_hold_delay_reasons),
         )
         self.portfolio.close_position(trade_id, trade)
         return trade

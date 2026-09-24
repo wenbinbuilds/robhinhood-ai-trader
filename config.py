@@ -30,6 +30,8 @@ FAST_WATCH_ONLY_OPEN_POSITIONS = False
 FAST_WATCH_MAX_SYMBOLS = 20
 FAST_QUOTE_LOG_INTERVAL_SECONDS = 60
 FAST_EVENT_LOG_MAX_BYTES = 1_000_000
+QUOTE_PROVENANCE_LOG_MAX_BYTES = 50_000_000
+QUOTE_PROVENANCE_LOG_PATH = "logs/quote_provenance.jsonl"
 SHADOW_ENTRY_VIA_FAST_WATCHLIST = True
 CANDIDATE_CONTEXT_TTL_SECONDS = SLOW_CYCLE_TARGET_SECONDS
 # Kept equal to the existing coordinator NO_TRADE boundary below.  It is an
@@ -182,12 +184,17 @@ SCANNER_SORT = {"column": "% Change", "direction": "desc"}
 
 # Experimental research-coordinator weights and thresholds. These are analysis
 # parameters, not trading authority, and every cycle logs the values used.
+# POSITION is a deterministic technical strategy with bounded contextual
+# confirmation.  All five inputs share the semantic [0, 1] scale where 0.5 is
+# neutral, but the previous 35/65 technical/context split made neutral context
+# more important than the actual setup.  Keep context meaningful without
+# allowing an ordinary absence of catalyst to become an accidental veto.
 COORDINATOR_WEIGHTS = {
-    "technical": 0.35,
-    "news": 0.20,
-    "sector": 0.10,
-    "market": 0.10,
-    "qualitative": 0.25,
+    "technical": 0.70,
+    "news": 0.10,
+    "sector": 0.05,
+    "market": 0.05,
+    "qualitative": 0.10,
 }
 COORDINATOR_NO_TRADE_THRESHOLD = 0.60
 COORDINATOR_TRADE_CANDIDATE_THRESHOLD = 0.72
@@ -244,10 +251,28 @@ RL_MINIMUM_LATENCY_SECONDS = 0.0
 SCALP_ENABLED = False
 SCALP_MODE = "SHADOW"
 SCALP_STRATEGY_ID = "SCALP_V1"
+# A bounded, explicit liquid-equity seed universe lets scalp discovery continue
+# when the momentum scanner has no results.  The current momentum scanner rows,
+# recent local candidates, and open positions are unioned with these symbols at
+# runtime; the shared market-data collector deduplicates the resulting request.
+SCALP_DISCOVERY_SOURCE = "LIQUID_EQUITY_SEED_PLUS_SHARED_ACTIVE_UNIVERSE"
+SCALP_DISCOVERY_SYMBOLS = (
+    "AAPL", "AMD", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "TSLA",
+)
+SCALP_DISCOVERY_MAX_SYMBOLS = 12
 SCALP_MAX_QUOTE_AGE_SECONDS = 2.0
 SCALP_MAX_MICRO_BAR_AGE_SECONDS = 120
+# Operational history-refresh cadence. These do not alter entry thresholds:
+# the existing 120 seconds above is provider lag allowed only after the next
+# five-minute bar should have completed.
+SCALP_MICRO_BAR_REFRESH_GRACE_SECONDS = 2.0
+SCALP_MICRO_BAR_REFRESH_RETRY_SECONDS = 30.0
 SCALP_MAX_SPREAD_PCT = 0.001
-SCALP_MIN_RELATIVE_VOLUME = 1.20
+SCALP_MIN_VOLUME_EXPANSION = 1.20
+# Backward-compatible configuration alias.  Production diagnostics and gate
+# reasons use VOLUME_EXPANSION because this value is a completed-short-bar
+# ratio, not a measure of executable depth or order-book liquidity.
+SCALP_MIN_RELATIVE_VOLUME = SCALP_MIN_VOLUME_EXPANSION
 SCALP_MIN_SIGNAL_SCORE = 0.70
 SCALP_MIN_EXPECTED_MOVE_PCT = 0.0015
 SCALP_MAX_EXPECTED_MOVE_PCT = 0.006
@@ -272,3 +297,4 @@ SCALP_PROFIT_PROTECTION_ENABLED = False
 SCALP_BREAKEVEN_ARM_R = 0.75
 SCALP_STATE_PATH = "state/scalp_setups.json"
 SCALP_EVENT_LOG_PATH = "logs/scalp_events.jsonl"
+SCALP_DIAGNOSTICS_PATH = "logs/scalp_diagnostics.jsonl"

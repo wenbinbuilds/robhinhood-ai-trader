@@ -109,7 +109,9 @@ def test_technical_bullish_but_news_strongly_negative() -> None:
 def test_strong_news_but_weak_technical_setup() -> None:
     market, news, technical, sector = inputs()
     technical = replace(technical, context=replace(technical.context, technical_score=0.3, confidence=0.3))
-    assert decide(market, news, technical, sector).decision == "WATCH"
+    # Context confirms a setup; it does not manufacture one when the
+    # deterministic technical core is weak.
+    assert decide(market, news, technical, sector).decision == "NO_TRADE"
 
 
 def test_mixed_signals_return_watch() -> None:
@@ -174,6 +176,48 @@ def test_missing_llm_reasoning_fails_closed() -> None:
     )
     assert result.decision == "NO_TRADE"
     assert "LLM_REASONING_UNAVAILABLE" in result.vetoes
+    assert result.qualitative_score == 0.5
+
+
+def test_position_score_semantics_make_watch_and_trade_reachable() -> None:
+    market, news, technical, sector = inputs()
+    neutral = llm_analysis(
+        sentiment="NEUTRAL", importance=0.5,
+        sector_bias="NEUTRAL", market_bias="NEUTRAL",
+        setup_quality=0.5, catalyst_quality=0.5,
+        continuation=0.5, conflict=0.5,
+    )
+
+    poor = replace(
+        technical, context=replace(technical.context, technical_score=0.3)
+    )
+    moderate = replace(
+        technical, context=replace(technical.context, technical_score=0.65)
+    )
+    strong = replace(
+        technical, context=replace(technical.context, technical_score=0.80)
+    )
+    complete = replace(
+        technical, context=replace(technical.context, technical_score=0.90)
+    )
+
+    assert decide(market, news, poor, sector, llm=neutral).decision == "NO_TRADE"
+    assert decide(market, news, moderate, sector, llm=neutral).decision == "WATCH"
+    assert decide(market, news, strong, sector, llm=neutral).decision == "WATCH"
+    assert decide(market, news, complete, sector).decision == "TRADE_CANDIDATE"
+
+
+def test_position_score_breakdown_sums_exactly_and_rejects_invalid_scales() -> None:
+    result = decide(*inputs())
+    assert round(sum(
+        component["contribution"]
+        for component in result.score_breakdown.values()
+    ), 3) == result.combined_score
+    market, news, technical, sector = inputs()
+    bad = replace(technical, context=replace(technical.context, technical_score=1.01))
+    import pytest
+    with pytest.raises(ValueError, match="technical score"):
+        decide(market, news, bad, sector)
 
 
 def test_extreme_llm_bullishness_cannot_override_technical_veto() -> None:

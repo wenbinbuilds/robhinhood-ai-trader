@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import config
@@ -61,6 +62,125 @@ def classify_decision(decision, candidates, reasoning_status):
                         infrastructure_vetoes=list(dict.fromkeys(infrastructure)))
     else:
         decision["decision_reason"] = "STRATEGY_REJECTION" if decision["type"] == "NO_TRADE" else "STRATEGY_WATCH"
+
+
+def _timestamp(value: Any) -> datetime | None:
+    try:
+        result = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+    if result.tzinfo is None:
+        result = result.replace(tzinfo=timezone.utc)
+    return result.astimezone(timezone.utc)
+
+
+def position_watch_candidate_traces(result) -> list[dict[str, Any]]:
+    """Extract post-score POSITION gates without changing cycle decisions."""
+
+    traces = []
+    for row in _rows(_mapping(result).get('analyzed_candidates')):
+        coordinator = _mapping(row.get('coordinator_decision'))
+        combined = coordinator.get('combined_score')
+        if not isinstance(combined, (int, float)) or combined < config.WATCHLIST_MIN_SLOW_CONTEXT_SCORE:
+            continue
+        metrics = _mapping(row.get('deterministic_technical_metrics'))
+        validation = _mapping(metrics.get('technical_validation'))
+        rules = {
+            item.get('rule_name'): item for item in _rows(validation.get('rules'))
+            if item.get('rule_name')
+        }
+        resistance_rule = _mapping(rules.get('RESISTANCE_ABOVE_ENTRY'))
+        resistance_actual = _mapping(resistance_rule.get('actual'))
+        entry = _score(resistance_actual.get('entry')) or None
+        resistance = _score(resistance_actual.get('resistance')) or None
+        stop = _mapping(rules.get('STOP_REFERENCE_AVAILABLE')).get('actual')
+        rr = _mapping(rules.get('MINIMUM_RISK_REWARD')).get('actual')
+        indicators = _mapping(row.get('supporting_indicators'))
+        support = indicators.get('intraday_support_reference')
+        target = row.get('target')
+        if target is None:
+            target = resistance
+        hard_results = {
+            str(name): _mapping(rule).get('status', 'UNAVAILABLE')
+            for name, rule in rules.items()
+            if _mapping(rule).get('type') == 'HARD'
+        }
+        hard_failures = _strings(validation.get(
+            'true_hard_gate_failures', coordinator.get('true_hard_gate_failures')
+        ))
+        signal_warnings = _strings(validation.get(
+            'signal_quality_failures', coordinator.get('signal_quality_failures')
+        ))
+        quote_at = _timestamp(metrics.get('quote_as_of'))
+        candle_at = _timestamp(metrics.get('latest_completed_bar_timestamp'))
+        candle_close = candle_at + timedelta(minutes=5) if candle_at else None
+        geometry_at = _timestamp(metrics.get('analysis_started_at'))
+        coherent = bool(
+            quote_at and candle_close and geometry_at
+            and quote_at >= candle_close and geometry_at >= quote_at
+        )
+        quote_age = metrics.get('quote_age_at_analysis_seconds')
+        quote_fresh = (
+            isinstance(quote_age, (int, float))
+            and 0 <= quote_age <= config.SLOW_ANALYSIS_QUOTE_MAX_AGE_SECONDS
+        )
+        distance = (
+            resistance-entry
+            if isinstance(resistance, (int, float)) and isinstance(entry, (int, float))
+            else None
+        )
+        risk_distance = (
+            entry-float(stop)
+            if isinstance(entry, (int, float)) and isinstance(stop, (int, float))
+            and entry > float(stop) else None
+        )
+        minimum_rr_distance = (
+            config.MIN_RISK_REWARD_RATIO*risk_distance
+            if risk_distance is not None else None
+        )
+        final_state = (
+            'HARD_GATE_REJECTED' if hard_failures
+            else str(coordinator.get('decision', row.get('decision', 'UNKNOWN')))
+        )
+        traces.append({
+            'symbol': row.get('symbol'),
+            'technical_score': coordinator.get('technical_score'),
+            'combined_score': combined,
+            'watch_threshold': config.WATCHLIST_MIN_SLOW_CONTEXT_SCORE,
+            'trade_threshold': config.COORDINATOR_TRADE_CANDIDATE_THRESHOLD,
+            'quote_age': quote_age,
+            'quote_fresh': quote_fresh,
+            'entry_reference_price': entry,
+            'support': support,
+            'resistance': resistance,
+            'resistance_distance_from_entry': distance,
+            'resistance_distance_percent': (
+                distance/entry if distance is not None and entry else None
+            ),
+            'minimum_resistance_above_entry_distance': 0.0,
+            'minimum_required_resistance_distance_for_RR': minimum_rr_distance,
+            'minimum_resistance_price_for_RR': (
+                entry+minimum_rr_distance
+                if entry is not None and minimum_rr_distance is not None else None
+            ),
+            'stop': stop,
+            'target': target,
+            'gross_RR': rr,
+            'net_RR': None,
+            'hard_gate_results': hard_results,
+            'final_state': final_state,
+            'primary_block': hard_failures[0] if hard_failures else (
+                'BELOW_TRADE_THRESHOLD'
+                if combined < config.COORDINATOR_TRADE_CANDIDATE_THRESHOLD else 'NONE'
+            ),
+            'secondary_blocks': [*hard_failures[1:], *signal_warnings],
+            'quote_timestamp': metrics.get('quote_as_of'),
+            'source_candle_timestamp': metrics.get('latest_completed_bar_timestamp'),
+            'source_candle_close_timestamp': candle_close.isoformat() if candle_close else None,
+            'geometry_timestamp': metrics.get('analysis_started_at'),
+            'coherent_geometry_timestamps': coherent,
+        })
+    return traces
 
 
 def cycle_diagnostic_lines(result):
@@ -153,6 +273,10 @@ def cycle_diagnostic_lines(result):
         for row in rows:
             metrics = _mapping(row.get("deterministic_technical_metrics"))
             yield f"CANDIDATE DATA: {row.get('symbol', 'UNAVAILABLE')} quote_age={metrics.get('quote_age_at_analysis_seconds')}s candles={metrics.get('analysis_candle_count')}"
+        for position_trace in position_watch_candidate_traces(root):
+            yield "[POSITION WATCH CANDIDATE] " + " ".join(
+                f"{name}={value}" for name, value in position_trace.items()
+            )
         if malformed:
             yield "DIAGNOSTICS STATUS: DEGRADED (malformed candidate rows ignored)"
     except Exception as exc:  # Diagnostics must never terminate the trading loop.

@@ -65,6 +65,8 @@ class ShadowPosition:
     research_cycle_id: str = ''
     entry_intent_id: str = ''
     strategy_id: str = ''
+    strategy_display_name: str = ''
+    entry_reason: str = ''
     risk_allocated: float = 0.0
     capital_allocated: float = 0.0
     quoted_entry_bid: float | None = None
@@ -73,11 +75,32 @@ class ShadowPosition:
     maximum_favorable_excursion: float = 0.0
     maximum_adverse_excursion: float = 0.0
     profit_protection_armed: bool = False
+    # Durable scalp lifecycle facts. Age is always recomputed from
+    # entry_timestamp; these fields are diagnostics, never a second timer.
+    scalp_lifecycle_state: str | None = None
+    scalp_lifecycle_updated_at: str | None = None
+    scalp_max_hold_seconds: int | None = None
+    scalp_hold_seconds: float | None = None
+    scalp_time_remaining_seconds: float | None = None
+    scalp_overdue_since: str | None = None
+    scalp_overdue_detected_at: str | None = None
+    scalp_overdue_by_seconds: float = 0.0
+    scalp_exit_status: str | None = None
+    scalp_exit_reason: str | None = None
+    scalp_latest_exit_quote_age_seconds: float | None = None
+    scalp_next_required_action: str | None = None
+    scalp_recovered: bool = False
+    scalp_max_hold_delay_reasons: list[str] = field(default_factory=list)
 
     def __post_init__(self):
+        from strategies.identity import strategy_display_name
         self.episode_id = self.episode_id or 'legacy:' + self.trade_id
         self.entry_intent_id = self.entry_intent_id or 'entry:' + self.episode_id
         self.strategy_id = self.strategy_id or self.strategy
+        self.strategy_display_name = (
+            self.strategy_display_name or strategy_display_name(self.strategy_id)
+        )
+        self.entry_reason = self.entry_reason or self.thesis or self.strategy_display_name
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ShadowPosition:
@@ -136,6 +159,8 @@ class ShadowTrade:
     price_source: str | None = None
     quote_timestamp: str | None = None
     strategy_id: str = ''
+    strategy_display_name: str = ''
+    entry_reason: str = ''
     risk_allocated: float = 0.0
     capital_allocated: float = 0.0
     quoted_entry_bid: float | None = None
@@ -148,12 +173,24 @@ class ShadowTrade:
     holding_time_seconds: float = 0.0
     maximum_favorable_excursion: float = 0.0
     maximum_adverse_excursion: float = 0.0
+    configured_max_hold_seconds: int | None = None
+    crossed_max_hold_at: str | None = None
+    exit_decision_at: str | None = None
+    max_hold_decision_delay_seconds: float | None = None
+    max_hold_close_delay_seconds: float | None = None
+    recovery_exit: bool = False
+    max_hold_delay_reasons: list[str] = field(default_factory=list)
 
     def __post_init__(self):
+        from strategies.identity import strategy_display_name
         self.episode_id = self.episode_id or 'legacy:' + self.trade_id
         self.entry_intent_id = self.entry_intent_id or 'entry:' + self.episode_id
         self.exit_intent_id = self.exit_intent_id or 'exit:' + self.trade_id
         self.strategy_id = self.strategy_id or self.strategy
+        self.strategy_display_name = (
+            self.strategy_display_name or strategy_display_name(self.strategy_id)
+        )
+        self.entry_reason = self.entry_reason or self.strategy_display_name
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ShadowTrade:

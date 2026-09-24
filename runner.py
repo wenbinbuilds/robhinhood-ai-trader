@@ -16,7 +16,6 @@ from agent.market_cycle import (
     JsonSnapshotProvider,
     MarketCycle,
     SnapshotValidationError,
-    is_regular_market_hours,
 )
 from agent.codex_mcp_bridge import (
     CodexMcpBridge,
@@ -39,6 +38,7 @@ from shadow.session_audit import ShadowSessionAudit
 from shadow.portfolio import ShadowPortfolio
 from shadow.execution import ShadowExecutionEngine
 from execution.shadow_executor import ShadowExecutor
+from execution.execution_guard import read_kill_switch
 from watcher.fast_watcher import FastPositionWatcher
 from watcher.quote_provider import RobinhoodDirectQuoteProvider, SnapshotQuoteProvider
 from watcher.scheduler import SlowMarketLoop
@@ -49,6 +49,7 @@ from agent.candidate_context import CandidateContextStore, contexts_from_cycle
 from watcher.candidate_watcher import FastCandidateWatcher
 from event_driven.orchestrator import ShadowEventOrchestrator
 from event_driven.reasoning import EventDrivenReasoningProvider
+from trading_runtime.observability import RuntimeDashboard, render_scalp_drilldown
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_SNAPSHOT = PROJECT_DIR / "state" / "market_snapshot.json"
@@ -75,18 +76,28 @@ def load_rl_shadow_runtime():
         ShadowComparator(PROJECT_DIR / config.RL_SHADOW_COMPARE_PATH))
 
 
-def load_scalp_runtime(portfolio, context_store, snapshot_path):
-    if not config.SCALP_ENABLED:
+def load_scalp_runtime(portfolio, context_store, snapshot_path, *, enabled=None,
+                       debug=False, direct_client=None):
+    scalp_enabled = config.SCALP_ENABLED if enabled is None else bool(enabled)
+    if not scalp_enabled:
         return None
     if config.SCALP_MODE != 'SHADOW' or config.MODE != 'SHADOW_TRADING':
         raise RuntimeError('scalp runtime is SHADOW_TRADING only')
     from strategies.scalp.runtime import ScalpRuntime
     from strategies.scalp.market_data import ScalpMarketDataCache
     cache = ScalpMarketDataCache(snapshot_path, context_store)
+    history_refresher = None
+    if direct_client is not None:
+        from strategies.scalp.history import ScalpHistoryRefresher
+        history_refresher = ScalpHistoryRefresher(direct_client, cache.get)
     return ScalpRuntime(
         portfolio, cache.get, universe=cache.symbols,
         setup_path=PROJECT_DIR/config.SCALP_STATE_PATH,
-        events_path=PROJECT_DIR/config.SCALP_EVENT_LOG_PATH)
+        events_path=PROJECT_DIR/config.SCALP_EVENT_LOG_PATH,
+        enabled=scalp_enabled, discovery_source=cache.source,
+        kill_switch_path=PROJECT_DIR/config.LIVE_KILL_SWITCH_PATH,
+        diagnostics_path=PROJECT_DIR/config.SCALP_DIAGNOSTICS_PATH,
+        debug=debug, history_refresher=history_refresher)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -130,6 +141,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     mode.add_argument("--scalp-status", action="store_true", help="show local scalp configuration and state")
     mode.add_argument("--scalp-summary", action="store_true", help="show strategy-attributed local scalp performance")
     mode.add_argument("--scalp-backtest", action="store_true", help="run chronological local scalp simulation")
+    mode.add_argument(
+        "--strategy-status", action="store_true",
+        help="show local POSITION, SCALP, and combined shadow status",
+    )
+    mode.add_argument(
+        "--scalp-drilldown", metavar="SYMBOL",
+        help="show the latest persisted full scalp trace for one symbol",
+    )
     parser.add_argument(
         "--snapshot",
         type=Path,
@@ -141,26 +160,93 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rl-model-id", default=None, help="explicit immutable model ID")
     parser.add_argument("--rl-timesteps", type=int, default=10_000)
     parser.add_argument("--scalp-input", type=Path, help="historical JSON/JSONL rows for scalp backtest")
+    parser.add_argument(
+        "--scalp-shadow", action="store_true",
+        help="enable SCALP_V1 for this --loop process in local shadow mode only",
+    )
+    parser.add_argument(
+        "--scalp-debug", action="store_true",
+        help="print per-candidate scalp traces; diagnostics are always persisted",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="enable verbose runtime diagnostics for all strategies",
+    )
     return parser.parse_args(argv)
 
 
+def _scalp_shadow_safety() -> tuple[bool, dict[str, object]]:
+    kill = read_kill_switch(PROJECT_DIR / config.LIVE_KILL_SWITCH_PATH)
+    status = {
+        'mode': config.MODE,
+        'scalp_mode': config.SCALP_MODE,
+        'live_trading_enabled': config.LIVE_TRADING_ENABLED,
+        'robinhood_execution_enabled': config.ROBINHOOD_EXECUTION_ENABLED,
+        'kill_switch': kill.status,
+        'trading_blocked': kill.trading_blocked,
+    }
+    safe = (
+        config.MODE == 'SHADOW_TRADING'
+        and config.SCALP_MODE == 'SHADOW'
+        and config.LIVE_TRADING_ENABLED is False
+        and config.ROBINHOOD_EXECUTION_ENABLED is False
+        and kill.trading_blocked is True
+    )
+    return safe, status
+
+
 def _scalp_command(args) -> int:
-    from strategies.scalp.analytics import scalp_summary, friction_sensitivity, strategy_attribution
+    from strategies.scalp.analytics import (
+        scalp_summary, friction_sensitivity, strategy_attribution,
+        scalp_session_summary,
+    )
     if args.scalp_status:
+        kill = read_kill_switch(PROJECT_DIR / config.LIVE_KILL_SWITCH_PATH)
+        open_scalp = None
+        try:
+            portfolio = ShadowPortfolio(SHADOW_STATE, SHADOW_TRADES)
+            open_scalp = sum(
+                position.strategy in {'SCALP', config.SCALP_STRATEGY_ID}
+                for position in portfolio.snapshot().open_positions
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
         payload = {'enabled': config.SCALP_ENABLED, 'mode': config.SCALP_MODE,
                    'strategy_id': config.SCALP_STRATEGY_ID,
+                   'candidate_discovery_source': config.SCALP_DISCOVERY_SOURCE,
+                   'candidate_seed_symbols': list(config.SCALP_DISCOVERY_SYMBOLS),
                    'max_quote_age_seconds': config.SCALP_MAX_QUOTE_AGE_SECONDS,
                    'max_spread_pct': config.SCALP_MAX_SPREAD_PCT,
                    'min_net_edge_pct': config.SCALP_MIN_EXPECTED_NET_EDGE,
                    'max_hold_seconds': config.SCALP_MAX_HOLD_SECONDS,
+                   'max_trades_per_symbol': config.SCALP_MAX_TRADES_PER_SYMBOL,
+                   'max_daily_loss_percent': config.SCALP_MAX_DAILY_LOSS_PERCENT,
+                   'diagnostics_path': config.SCALP_DIAGNOSTICS_PATH,
+                   'open_scalp_positions': open_scalp,
+                   'runtime_override': '--loop --scalp-shadow',
+                   'debug_runtime_override': '--loop --scalp-shadow --scalp-debug',
+                   'safety': {'mode': config.MODE,
+                              'live_trading_enabled': config.LIVE_TRADING_ENABLED,
+                              'robinhood_execution_enabled': config.ROBINHOOD_EXECUTION_ENABLED,
+                              'kill_switch': kill.status,
+                              'trading_blocked': kill.trading_blocked},
                    'live_supported': False}
         print(json.dumps(payload, indent=2, sort_keys=True)); return 0
     try: portfolio = ShadowPortfolio(SHADOW_STATE, SHADOW_TRADES)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f'SCALP STATE ERROR: {type(exc).__name__}: {exc}', file=sys.stderr); return 2
     if args.scalp_summary:
+        from watcher.quote_diagnostics import quote_provenance_summary
         state = portfolio.snapshot()
         print(json.dumps({'performance': scalp_summary(state.closed_positions),
+                          'session': scalp_session_summary(
+                              PROJECT_DIR / config.SCALP_DIAGNOSTICS_PATH,
+                              state.closed_positions,
+                          ),
+                          'quote_freshness': quote_provenance_summary(
+                              PROJECT_DIR / config.QUOTE_PROVENANCE_LOG_PATH,
+                              strategy='SCALP',
+                          ),
                           'attribution': strategy_attribution(portfolio)}, indent=2, sort_keys=True))
         return 0
     if args.scalp_backtest:
@@ -184,6 +270,160 @@ def _scalp_command(args) -> int:
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             print(f'SCALP BACKTEST FAILED: {type(exc).__name__}: {exc}', file=sys.stderr); return 2
     return 2
+
+
+def _strategy_status() -> int:
+    """Local-only two-strategy status; never constructs a Robinhood client."""
+
+    from strategies.scalp.analytics import (
+        scalp_session_summary, scalp_summary, strategy_attribution,
+    )
+    from watcher.quote_diagnostics import quote_provenance_summary
+    try:
+        portfolio = ShadowPortfolio(SHADOW_STATE, SHADOW_TRADES)
+        state = portfolio.snapshot()
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f'STRATEGY STATE ERROR: {type(exc).__name__}: {exc}', file=sys.stderr)
+        return 2
+    try:
+        candidates = CandidateContextStore(
+            PROJECT_DIR / config.CANDIDATE_WATCHLIST_PATH
+        ).snapshot()
+    except (OSError, ValueError, json.JSONDecodeError):
+        candidates = []
+    attribution = strategy_attribution(portfolio)
+    scalp_session = scalp_session_summary(
+        PROJECT_DIR / config.SCALP_DIAGNOSTICS_PATH,
+        state.closed_positions,
+    )
+    scalp_performance = scalp_summary(state.closed_positions)
+    position = attribution['POSITION']
+    scalp = attribution['SCALP']
+    position_closed = [
+        trade for trade in state.closed_positions
+        if getattr(trade, 'strategy_display_name', '') == 'POSITION'
+    ]
+    payload = {
+        'strategies': {
+            'POSITION': {
+                'status': 'ENABLED', 'internal_id': 'MOMENTUM',
+                'style': 'LONGER_HORIZON', 'llm': 'ENABLED',
+                'watch_threshold': config.WATCHLIST_MIN_SLOW_CONTEXT_SCORE,
+                'trade_threshold': config.COORDINATOR_TRADE_CANDIDATE_THRESHOLD,
+                'confirmation_count': config.FAST_ENTRY_CONFIRMATION_UPDATES,
+                'minimum_rr': config.MIN_RISK_REWARD_RATIO,
+                'candidates': len(candidates),
+                'watchlist': sum(item.status == 'WATCH' for item in candidates),
+                'confirmed': sum(
+                    item.consecutive_qualifying_updates
+                    >= config.FAST_ENTRY_CONFIRMATION_UPDATES
+                    for item in candidates
+                ),
+                'entry_attempts': position['open_positions'] + position['trade_count'],
+                'open_positions': position['open_positions'],
+                'exits': len(position_closed),
+                'realized_pnl': position['realized_pnl'],
+                'unrealized_pnl': position['unrealized_pnl'],
+            },
+            'SCALP': {
+                'status': ('ENABLED_SHADOW' if config.SCALP_ENABLED else 'DISABLED_DEFAULT'),
+                'internal_id': 'SCALP', 'style': 'FAST_SHORT_HORIZON',
+                'llm': 'DISABLED', 'max_hold_seconds': config.SCALP_MAX_HOLD_SECONDS,
+                'signal_threshold': config.SCALP_MIN_SIGNAL_SCORE,
+                'observations': scalp_session['candidate_observations'],
+                'valid_fast_setups': scalp_session['funnel']['eligible_micro_signals'],
+                'entries': scalp_session['shadow_entries'],
+                'open_scalps': scalp['open_positions'],
+                'normal_exits': scalp_session['exits'] - scalp_session['recovery_time_exits'],
+                'time_exits': scalp_session['normal_time_exits'],
+                'recovery_exits': scalp_session['recovery_time_exits'],
+                'wins': scalp_performance['wins'],
+                'losses': scalp_performance['losses'],
+                'realized_pnl': scalp['realized_pnl'],
+                'unrealized_pnl': scalp['unrealized_pnl'],
+                'net_pnl': scalp_performance['net_pnl'],
+            },
+        },
+        'portfolio': {
+            'POSITION': position, 'SCALP': scalp,
+            'TOTAL': {
+                'equity': state.equity, 'cash': state.cash,
+                'realized_pnl': state.realized_pnl,
+                'unrealized_pnl': state.unrealized_pnl,
+                'total_pnl': state.realized_pnl + state.unrealized_pnl,
+            },
+        },
+        'quote_freshness': {
+            strategy: quote_provenance_summary(
+                PROJECT_DIR / config.QUOTE_PROVENANCE_LOG_PATH,
+                strategy=strategy,
+            )
+            for strategy in ('POSITION', 'SCALP')
+        },
+        'safety': {
+            'mode': config.MODE,
+            'live_trading_enabled': config.LIVE_TRADING_ENABLED,
+            'robinhood_execution_enabled': config.ROBINHOOD_EXECUTION_ENABLED,
+            'live_supported': False,
+        },
+    }
+    p = payload['strategies']['POSITION']
+    s = payload['strategies']['SCALP']
+    total = payload['portfolio']['TOTAL']
+    print("TRADER — SHADOW MODE")
+    print("Safety: SHADOW ONLY — LIVE EXECUTION BLOCKED")
+    print(
+        f"Portfolio: equity=${total['equity']:.2f} cash=${total['cash']:.2f} "
+        f"realized=${total['realized_pnl']:+.2f} unrealized=${total['unrealized_pnl']:+.2f}"
+    )
+    print("POSITION")
+    print(
+        f"  status={p['status']} candidates={p['candidates']} watching={p['watchlist']} "
+        f"confirmed={p['confirmed']} open={p['open_positions']} exits={p['exits']} "
+        f"realized=${p['realized_pnl']:+.2f} unrealized=${p['unrealized_pnl']:+.2f}"
+    )
+    print(
+        f"  thresholds: watch={p['watch_threshold']:.2f} trade={p['trade_threshold']:.2f} "
+        f"confirmations={p['confirmation_count']} minimum_rr={p['minimum_rr']}"
+    )
+    print("SCALP")
+    print(
+        f"  status={s['status']} observations={s['observations']} eligible={s['valid_fast_setups']} "
+        f"entries={s['entries']} open={s['open_scalps']} exits={s['normal_exits'] + s['recovery_exits']} "
+        f"realized=${s['realized_pnl']:+.2f} unrealized=${s['unrealized_pnl']:+.2f}"
+    )
+    print(
+        f"  signal_threshold={s['signal_threshold']:.2f} max_hold={s['max_hold_seconds']}s "
+        f"wins={s['wins']} losses={s['losses']}"
+    )
+    return 0
+
+
+def _scalp_drilldown(symbol: str) -> int:
+    """Read-only inspection of the latest durable candidate observation."""
+
+    wanted = symbol.upper()
+    latest = None
+    path = PROJECT_DIR / config.SCALP_DIAGNOSTICS_PATH
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (row.get("record_type") == "CANDIDATE_OBSERVATION"
+                        and row.get("symbol") == wanted
+                        and isinstance(row.get("payload"), Mapping)):
+                    latest = row["payload"]
+    except OSError as exc:
+        print(f"SCALP DEBUG ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    if latest is None:
+        print(f"SCALP DEBUG: no persisted observation for {wanted}", file=sys.stderr)
+        return 3
+    print(render_scalp_drilldown(latest))
+    return 0
 
 
 def _rl_command(args) -> int:
@@ -288,6 +528,7 @@ def refresh_and_run(
     context_store: CandidateContextStore | None = None,
     event_orchestrator: ShadowEventOrchestrator | None = None,
     reasoning_provider=None,
+    scalp_enabled: bool = False,
 ) -> tuple[int, dict[str, object] | None]:
     cycle_started_at = datetime.now(timezone.utc)
     cycle_start = time.monotonic()
@@ -344,7 +585,10 @@ def refresh_and_run(
             snapshot_start = time.monotonic()
             snapshot_started_at = datetime.now(timezone.utc)
             refresh = (
-                bridge.refresh(shadow_symbols=shadow_symbols)
+                bridge.refresh(
+                    shadow_symbols=shadow_symbols,
+                    scalp_symbols=(config.SCALP_DISCOVERY_SYMBOLS if scalp_enabled else ()),
+                )
                 if config.ROBINHOOD_DATA_PROVIDER == "DIRECT_MCP"
                 else bridge.refresh(acquire_lock=False, shadow_symbols=shadow_symbols)
             )
@@ -501,6 +745,35 @@ def refresh_and_run(
                 f"(no completed slow result met admission score "
                 f"{config.WATCHLIST_MIN_SLOW_CONTEXT_SCORE})"
             )
+        analyzed = [
+            row for row in result.get("analyzed_candidates", [])
+            if isinstance(row, Mapping)
+        ]
+        combined_scores = [
+            float(score) for row in analyzed
+            if isinstance(row.get("coordinator_decision"), Mapping)
+            and (score := row["coordinator_decision"].get("combined_score"))
+                is not None
+        ]
+        trade_ready = sum(
+            isinstance(row.get("coordinator_decision"), Mapping)
+            and row["coordinator_decision"].get("decision") == "TRADE_CANDIDATE"
+            for row in analyzed
+        )
+        primary = (
+            "SCORE_BELOW_WATCH_THRESHOLD"
+            if analyzed and not contexts and combined_scores
+            and max(combined_scores) < config.WATCHLIST_MIN_SLOW_CONTEXT_SCORE
+            else "HARD_OR_CONTEXT_GATE" if analyzed and not contexts
+            else "NONE"
+        )
+        print("POSITION STATUS")
+        print(
+            f"candidates={len(analyzed)} watch_admitted={len(contexts)} "
+            f"trade_ready={trade_ready} "
+            f"top_combined_score={max(combined_scores) if combined_scores else None} "
+            f"primary_bottleneck={primary}"
+        )
     atomic_json(PROJECT_DIR / "state" / "slow_loop_status.json", timing)
     log_path = PROJECT_DIR / "logs" / f"{cycle_started_at.astimezone(ZoneInfo(config.MARKET_TIMEZONE)).date().isoformat()}.jsonl"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -745,6 +1018,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _rl_command(args)
     if any((args.scalp_status, args.scalp_summary, args.scalp_backtest)):
         return _scalp_command(args)
+    if args.scalp_drilldown:
+        return _scalp_drilldown(args.scalp_drilldown)
+    if args.strategy_status:
+        return _strategy_status()
     if args.robinhood_auth:
         return robinhood_auth()
     if args.robinhood_mcp_check:
@@ -758,6 +1035,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.shadow_summary:
         return print_shadow_summary()
+    if args.scalp_shadow and not args.loop:
+        print("--scalp-shadow is supported only with --loop", file=sys.stderr)
+        return 2
+    scalp_enabled = bool(config.SCALP_ENABLED or args.scalp_shadow)
+    debug_runtime = bool(args.debug or args.scalp_debug)
+    if debug_runtime and (not args.loop or not scalp_enabled):
+        print("--scalp-debug requires an enabled shadow scalp --loop", file=sys.stderr)
+        return 2
+    if scalp_enabled:
+        scalp_safe, scalp_safety = _scalp_shadow_safety()
+        if not scalp_safe:
+            print(
+                "SCALP SHADOW START REFUSED: "
+                + json.dumps(scalp_safety, sort_keys=True),
+                file=sys.stderr,
+            )
+            return 2
+    if args.loop and debug_runtime:
+        print("STRATEGIES:")
+        print("POSITION:")
+        print("status=ENABLED")
+        print("style=LONGER_HORIZON")
+        print("LLM=ENABLED")
+        print(f"watch_threshold={config.WATCHLIST_MIN_SLOW_CONTEXT_SCORE:.2f}")
+        print(f"trade_threshold={config.COORDINATOR_TRADE_CANDIDATE_THRESHOLD:.2f}")
+        print("SCALP:")
+        print("status=" + ("ENABLED_SHADOW" if scalp_enabled else "DISABLED"))
+        print("style=FAST_SHORT_HORIZON")
+        print("LLM=DISABLED")
+        print(f"max_hold={config.SCALP_MAX_HOLD_SECONDS}s")
+        print(f"signal_threshold={config.SCALP_MIN_SIGNAL_SCORE:.2f}")
+    elif args.loop:
+        print("TRADER — SHADOW MODE | SHADOW ONLY | LIVE EXECUTION BLOCKED", flush=True)
     try:
         # One process owns the shared shadow state for the WHOLE loop lifetime,
         # including time between slow cycles. Also excludes --once and reset.
@@ -858,6 +1168,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                         client, project_dir=PROJECT_DIR
                                     ),
                                     rl_shadow_runtime=load_rl_shadow_runtime(),
+                                    debug=debug_runtime,
                                 )
                                 if context_store is not None else None
                             )
@@ -867,7 +1178,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 events_path=PROJECT_DIR / "logs" / "fast_watcher.jsonl",
                                 candidate_watcher=candidate_watcher,
                                 event_orchestrator=event_orchestrator,
-                                scalp_runtime=load_scalp_runtime(portfolio, context_store, snapshot),
+                                scalp_runtime=load_scalp_runtime(
+                                    portfolio, context_store, snapshot,
+                                    enabled=scalp_enabled, debug=debug_runtime,
+                                    direct_client=client,
+                                ),
+                                debug=debug_runtime,
+                                dashboard=(None if debug_runtime else RuntimeDashboard(
+                                    portfolio, context_store,
+                                    PROJECT_DIR / config.LIVE_KILL_SWITCH_PATH,
+                                )),
                             )
                             print("FAST QUOTE MODE: DIRECT_ROBINHOOD_MCP (performance not yet validated as REALTIME_FAST)")
                         if event_orchestrator is not None:
@@ -879,6 +1199,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                     context_store=context_store,
                                     event_orchestrator=event_orchestrator,
                                     reasoning_provider=reasoning_provider,
+                                    scalp_enabled=scalp_enabled,
                                 ), watcher=watcher,
                                 has_positions=has_shadow_work,
                                 status_path=PROJECT_DIR / "state" / "slow_loop_status.json",
@@ -902,6 +1223,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         score_history_path=PROJECT_DIR / config.CANDIDATE_SCORE_HISTORY_PATH,
                         event_orchestrator=event_orchestrator,
                         rl_shadow_runtime=load_rl_shadow_runtime(),
+                        debug=debug_runtime,
                     )
                     if context_store is not None else None
                 )
@@ -911,7 +1233,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     events_path=PROJECT_DIR / "logs" / "fast_watcher.jsonl",
                     candidate_watcher=candidate_watcher,
                     event_orchestrator=event_orchestrator,
-                    scalp_runtime=load_scalp_runtime(portfolio, context_store, snapshot),
+                    scalp_runtime=load_scalp_runtime(
+                        portfolio, context_store, snapshot,
+                        enabled=scalp_enabled, debug=debug_runtime,
+                    ),
+                    debug=debug_runtime,
+                    dashboard=(None if debug_runtime else RuntimeDashboard(
+                        portfolio, context_store,
+                        PROJECT_DIR / config.LIVE_KILL_SWITCH_PATH,
+                    )),
                 )
                 print("FAST QUOTE MODE: DEGRADED_SNAPSHOT (legacy provider)")
             if event_orchestrator is not None:
@@ -922,6 +1252,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         snapshot, portfolio, context_store=context_store,
                         event_orchestrator=event_orchestrator,
                         reasoning_provider=reasoning_provider,
+                        scalp_enabled=scalp_enabled,
                     ), watcher=watcher,
                     has_positions=has_shadow_work,
                     status_path=PROJECT_DIR / "state" / "slow_loop_status.json",

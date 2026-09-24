@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Protocol
 
 import config
@@ -147,6 +147,14 @@ class PreExecutionValidator:
             )
 
         market_data = self.merge_market_data(canonical_context, refreshed_data)
+        geometry_timestamps = self.geometry_timestamp_evidence(market_data, current)
+        market_data['geometry_timestamps'] = geometry_timestamps
+        if (market_data.get('structure_evidence')
+                and not geometry_timestamps['coherent']):
+            return self._rejected(
+                symbol, current, 'GEOMETRY_TIMESTAMPS_INCOHERENT',
+                market_data=market_data, quote_age=quote_age,
+            )
 
         from agent.candidate_analyzer import CandidateData
         from agent.gate_policy import failed_gates
@@ -283,6 +291,49 @@ class PreExecutionValidator:
         )
 
     @staticmethod
+    def geometry_timestamp_evidence(
+        market_data: Mapping[str, Any], evaluated_at: datetime,
+    ) -> dict[str, Any]:
+        """Prove the quote is no older than the completed structural bar set."""
+
+        quote_at = parse_timestamp(market_data.get('quote_as_of'))
+        structure = market_data.get('structure_evidence')
+        structure = structure if isinstance(structure, Mapping) else {}
+        bar_at = parse_timestamp(structure.get('latest_completed_bar'))
+        interval_seconds = 300.0
+        if bar_at is not None:
+            for candle in market_data.get('candles', []) or []:
+                if not isinstance(candle, Mapping):
+                    continue
+                if parse_timestamp(candle.get('begins_at')) == bar_at:
+                    raw_interval = candle.get('interval_seconds', 300)
+                    if isinstance(raw_interval, (int, float)) and raw_interval > 0:
+                        interval_seconds = float(raw_interval)
+                    break
+        bar_close = bar_at + timedelta(seconds=interval_seconds) if bar_at else None
+        refreshed_at = parse_timestamp(market_data.get('refresh_completed_at'))
+        current = evaluated_at.astimezone(timezone.utc)
+        coherent = bool(
+            quote_at and bar_close
+            and quote_at >= bar_close
+            and quote_at <= current
+            and (refreshed_at is None or quote_at <= refreshed_at <= current)
+        )
+        return {
+            'quote_timestamp': quote_at.isoformat() if quote_at else None,
+            'support_timestamp': bar_at.isoformat() if bar_at else None,
+            'resistance_timestamp': bar_at.isoformat() if bar_at else None,
+            'latest_completed_bar_timestamp': bar_at.isoformat() if bar_at else None,
+            'latest_completed_bar_close_timestamp': (
+                bar_close.isoformat() if bar_close else None
+            ),
+            'structure_generated_at': refreshed_at.isoformat() if refreshed_at else None,
+            'geometry_evaluated_at': current.isoformat(),
+            'coherent': coherent,
+            'rule': 'quote_timestamp >= latest_completed_bar_close_timestamp',
+        }
+
+    @staticmethod
     def merge_market_data(
         canonical_context: Mapping[str, Any] | None,
         refreshed: Mapping[str, Any],
@@ -381,6 +432,7 @@ class PreExecutionValidator:
             "symbol": symbol,
             "status": status,
             'geometry_diagnostics': metrics.get('geometry_diagnostics'),
+            'geometry_timestamps': market_data.get('geometry_timestamps'),
             "refreshed_quote_as_of": market_data.get("quote_as_of"),
             "refreshed_quote_age_seconds": quote_age,
             "refreshed_bid": market_data.get("bid"),

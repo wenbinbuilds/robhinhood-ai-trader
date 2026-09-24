@@ -144,16 +144,17 @@ def normalized_realized_pnl(value: Any) -> str | float | None:
     return number(value)
 
 
+def project_scans(value: Any) -> list[Mapping[str, Any]]:
+    return [
+        row for row in mappings(value)
+        if text(first(row, "name", "scan_name", "title"))
+        == config.PROJECT_SCANNER_NAME
+    ]
+
+
 def find_project_scan(value: Any) -> Mapping[str, Any] | None:
-    return next(
-        (
-            row
-            for row in mappings(value)
-            if text(first(row, "name", "scan_name", "title"))
-            == config.PROJECT_SCANNER_NAME
-        ),
-        None,
-    )
+    rows = project_scans(value)
+    return rows[0] if rows else None
 
 
 def safe_scan_id(row: Mapping[str, Any]) -> str | None:
@@ -233,7 +234,12 @@ def normalized_criteria(scan: Mapping[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
-def normalized_scanner(scan: Mapping[str, Any], run_result: Any, ranked: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def normalized_scanner(
+    scan: Mapping[str, Any], run_result: Any,
+    ranked: Sequence[Mapping[str, Any]], *, query_executed_at: datetime | None = None,
+    saved_definition_count: int = 1,
+) -> dict[str, Any]:
+    raw_count = len(scanner_candidates(run_result))
     return {
         "status": "OK",
         "scan_name": config.PROJECT_SCANNER_NAME,
@@ -241,7 +247,19 @@ def normalized_scanner(scan: Mapping[str, Any], run_result: Any, ranked: Sequenc
         "lifecycle_action": "REUSED",
         "criteria": normalized_criteria(scan),
         "sort_configuration": dict(config.SCANNER_SORT),
-        "result_count": len(scanner_candidates(run_result)),
+        "result_count": raw_count,
+        # REUSED describes the saved definition.  Results are produced by the
+        # run_scan call made during this collection and are never a local cache.
+        "results_source": "FRESH_PROVIDER_RUN",
+        "query_executed_at": (
+            query_executed_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            if query_executed_at is not None else None
+        ),
+        "provider_raw_count": raw_count,
+        "saved_definition_count": saved_definition_count,
+        "after_provider_filters_count": raw_count,
+        "after_local_filters_count": raw_count,
+        "top_n_count": len(ranked),
         "candidates": [
             {
                 "symbol": row["symbol"],
@@ -347,6 +365,11 @@ def normalized_historicals(value: Any, symbol: str) -> dict[str, Any]:
                 "open": opened, "high": high, "low": low, "close": close,
                 "volume": volume,
                 "interpolated": bool(first(row, "interpolated", "is_interpolated") or False),
+                # DirectSnapshotCollector requests Robinhood's five-minute
+                # interval.  Keep that contract attached to every bar so
+                # downstream freshness never has to guess its timeframe.
+                "interval_seconds": 300.0,
+                "bar_source": "ROBINHOOD_MCP_HISTORICALS_5MINUTE",
             })
     return {
         "symbol": symbol,

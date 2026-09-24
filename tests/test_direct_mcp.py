@@ -203,11 +203,38 @@ def test_direct_snapshot_generation_indicators_atomic_and_no_secrets(tmp_path):
     assert stored["mcp_access_path"] == "DIRECT_MCP"
     assert stored["account"]["is_agentic_account"] is True
     assert stored["scanner"]["result_count"] == 2
+    assert stored["scanner"]["provider_raw_count"] == 2
+    assert stored["scanner"]["saved_definition_count"] == 1
+    assert stored["scanner"]["top_n_count"] == 2
+    assert stored["scanner"]["results_source"] == "FRESH_PROVIDER_RUN"
     assert [row["symbol"] for row in stored["candidate_data"]] == ["ACME", "BETA"]
+    assert all(row["strategy_id"] == "MOMENTUM" for row in stored["candidate_data"])
+    assert all(row["provider_status"] == "OK" for row in stored["candidate_data"])
+    assert all(row["quote_status"] == "FRESH" for row in stored["candidate_data"])
     assert stored["candidate_data"][0]["ema9"] is not None
     serialized = output.read_text().lower()
     assert "access_token" not in serialized and "refresh_token" not in serialized
     assert not list(output.parent.glob(f".{output.name}.*"))
+
+
+def test_zero_momentum_results_still_collects_independent_scalp_universe(tmp_path):
+    class ZeroMomentum(FakeDirectClient):
+        def run_project_scan(self, *, scan_id, account=None):
+            self.calls.append("run_scan")
+            return ToolCall("run_scan", {"scan_name": config.PROJECT_SCANNER_NAME}, {"results": []}, .02)
+
+    output = tmp_path / "snapshot.json"
+    result = DirectSnapshotCollector(
+        ZeroMomentum(), project_dir=Path.cwd(), snapshot_path=output,
+        timing_path=tmp_path / "timing.json", metadata_cache_path=tmp_path / "cache.json",
+        clock=lambda: NOW,
+    ).refresh(scalp_symbols=["SCALPONLY"])
+    assert result.connected
+    assert result.snapshot["scanner"]["result_count"] == 0
+    assert result.snapshot["candidate_data"] == []
+    assert [row["symbol"] for row in result.snapshot["scalp_candidate_data"]] == ["SCALPONLY"]
+    assert result.snapshot["scalp_candidate_data"][0]["strategy_id"] == "SCALP"
+    assert result.snapshot["scalp_candidate_data"][0]["relative_volume_source"] == "COMPLETED_MICRO_BAR_RATIO"
 
 
 def test_pre_execution_provider_fetches_only_selected_symbol(tmp_path):

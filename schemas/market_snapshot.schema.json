@@ -150,6 +150,13 @@
           }
         },
         "result_count": {"type": "integer", "minimum": 0},
+        "results_source": {"type": "string", "enum": ["FRESH_PROVIDER_RUN", "LOCAL_CACHE", "UNAVAILABLE"]},
+        "query_executed_at": {"type": ["string", "null"]},
+        "provider_raw_count": {"type": "integer", "minimum": 0},
+        "saved_definition_count": {"type": "integer", "minimum": 0},
+        "after_provider_filters_count": {"type": "integer", "minimum": 0},
+        "after_local_filters_count": {"type": "integer", "minimum": 0},
+        "top_n_count": {"type": "integer", "minimum": 0},
         "candidates": {
           "type": "array",
           "maxItems": 10,
@@ -178,6 +185,10 @@
       }
     },
     "candidate_data": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/candidate"}
+    },
+    "scalp_candidate_data": {
       "type": "array",
       "items": {"$ref": "#/$defs/candidate"}
     },
@@ -238,7 +249,9 @@
         "low": {"type": "number"},
         "close": {"type": "number"},
         "volume": {"type": "number"},
-        "interpolated": {"type": "boolean"}
+        "interpolated": {"type": "boolean"},
+        "interval_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "bar_source": {"type": "string"}
       }
     },
     "candidate": {
@@ -254,6 +267,7 @@
       ],
       "properties": {
         "symbol": {"type": "string"},
+        "strategy_id": {"type": ["string", "null"], "enum": ["MOMENTUM", "SCALP", null]},
         "current_price": {"type": ["number", "null"]},
         "bid": {"type": ["number", "null"]},
         "ask": {"type": ["number", "null"]},
@@ -262,8 +276,12 @@
         "quote_request_started_at": {"type": ["string", "null"]},
         "candidate_quote_retrieved_at": {"type": ["string", "null"]},
         "quote_freshness_source": {"type": "string", "enum": ["exchange_timestamp", "retrieval_timestamp", "unavailable"]},
+        "provider_status": {"type": "string", "enum": ["OK", "UNAVAILABLE", "ERROR"]},
+        "quote_status": {"type": "string", "enum": ["FRESH", "STALE", "UNAVAILABLE"]},
+        "quote_age_seconds": {"type": ["number", "null"]},
         "volume": {"type": ["number", "null"]},
         "relative_volume": {"type": ["number", "null"]},
+        "relative_volume_source": {"type": "string", "enum": ["PROVIDER", "MOMENTUM_SCANNER", "COMPLETED_MICRO_BAR_RATIO", "UNAVAILABLE"]},
         "vwap": {"type": ["number", "null"]},
         "ema9": {"type": ["number", "null"]},
         "ema20": {"type": ["number", "null"]},

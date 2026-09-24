@@ -122,6 +122,29 @@ def test_journal_replay_is_idempotent_and_nonexecuting(tmp_path):
     assert len(journal.read()) == 1
 
 
+def test_journal_ignores_legacy_closed_trade_rows_and_outbox_can_repair(tmp_path):
+    path = tmp_path/'events.jsonl'
+    path.write_text(json.dumps({
+        'trade_id': 't1', 'episode_id': 'e1',
+        'exit_timestamp': NOW.isoformat(), 'exit_reason': 'STOP_HIT',
+    }) + '\n')
+    journal = EventJournal(path)
+    assert journal.read() == []
+    event = RuntimeEvent(
+        RuntimeEventType.POSITION_CLOSED, NOW.isoformat(), 'ACME', 'e1',
+        payload={'trade_id': 't1'}, event_id='exit-t1',
+    )
+    assert journal.append(event) is True
+    assert journal.replay()['closed_episodes'] == ['e1']
+
+
+def test_journal_still_rejects_unknown_rows_without_event_identity(tmp_path):
+    path = tmp_path/'events.jsonl'
+    path.write_text(json.dumps({'unexpected': 'shape'}) + '\n')
+    with pytest.raises(ValueError, match='has no event_id'):
+        EventJournal(path)
+
+
 def test_alpha_snapshots_are_symbol_specific_and_geometry_independent():
     a = context()
     b = replace(context(), symbol='OTHER', episode_id='')

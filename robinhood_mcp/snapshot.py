@@ -37,10 +37,14 @@ from robinhood_mcp.normalization import (
     normalized_quotes,
     normalized_realized_pnl,
     normalized_scanner,
+    project_scans,
     safe_scan_id,
     scanner_candidates,
 )
 from watcher.storage import atomic_json
+from watcher.storage import event
+from watcher.models import FastQuote, price, timestamp
+from watcher.quote_provider import quote_provenance
 
 
 @dataclass(frozen=True)
@@ -123,16 +127,28 @@ class DirectSnapshotCollector:
             metadata_cache_path or config.INSTRUMENT_METADATA_CACHE_PATH
         )
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.quote_provenance_path = (
+            self.project_dir / config.QUOTE_PROVENANCE_LOG_PATH
+            if self.snapshot_path.parent == self.project_dir / 'state'
+            else self.snapshot_path.parent / Path(config.QUOTE_PROVENANCE_LOG_PATH).name
+        )
+        self._last_quote_poll_at: dict[str, datetime] = {}
+        self._last_exchange_timestamp: dict[str, datetime] = {}
 
     def _resolve(self, path: str | Path) -> Path:
         value = Path(path)
         return value if value.is_absolute() else self.project_dir / value
 
-    def refresh(self, *, shadow_symbols: Sequence[str] = ()) -> DirectRefreshResult:
+    def refresh(
+        self, *, shadow_symbols: Sequence[str] = (),
+        scalp_symbols: Sequence[str] = (),
+    ) -> DirectRefreshResult:
         started = time.monotonic()
         timing = DirectTiming(connection_latency_seconds=self.client.connection_latency_seconds)
         try:
-            snapshot, bridge_status = self._collect(timing, shadow_symbols=shadow_symbols)
+            snapshot, bridge_status = self._collect(
+                timing, shadow_symbols=shadow_symbols, scalp_symbols=scalp_symbols,
+            )
             self._validate(snapshot)
             write_start = time.monotonic()
             atomic_json(self.snapshot_path, snapshot)
@@ -181,7 +197,10 @@ class DirectSnapshotCollector:
                 "duration_seconds": round(call.duration_seconds, 6),
             })
 
-    def _collect(self, timing: DirectTiming, *, shadow_symbols: Sequence[str]) -> tuple[dict[str, Any], str]:
+    def _collect(
+        self, timing: DirectTiming, *, shadow_symbols: Sequence[str],
+        scalp_symbols: Sequence[str],
+    ) -> tuple[dict[str, Any], str]:
         accounts = self._call("get_accounts")
         self._record(timing, "account", accounts)
         account, raw_account = normalized_account(accounts.value)
@@ -232,7 +251,10 @@ class DirectSnapshotCollector:
         market_status, is_regular, _ = regular_session(now)
         ranked = rank_scanner_candidates(raw_candidates) if is_regular else []
         print("TOP CANDIDATES: " + (", ".join(row["symbol"] for row in ranked) or "NONE"))
-        scanner = normalized_scanner(project_scan, run_call.value, ranked)
+        scanner = normalized_scanner(
+            project_scan, run_call.value, ranked, query_executed_at=now,
+            saved_definition_count=len(project_scans(scans_call.value)),
+        )
         if not is_regular:
             scanner["status"] = "SKIPPED_MARKET_CLOSED"
             scanner["lifecycle_action"] = "SKIPPED"
@@ -245,9 +267,16 @@ class DirectSnapshotCollector:
                 if str(symbol).strip()
             }
         )
+        normalized_scalp = list(dict.fromkeys(
+            str(symbol).upper().strip()
+            for symbol in scalp_symbols
+            if str(symbol).strip()
+        ))[: config.SCALP_DISCOVERY_MAX_SYMBOLS]
         candidate_symbols = [row["symbol"] for row in ranked]
         deep_symbols = list(dict.fromkeys(candidate_symbols + normalized_shadow))
-        requested = list(dict.fromkeys(["SPY", "QQQ"] + deep_symbols))
+        requested = list(dict.fromkeys(
+            ["SPY", "QQQ"] + deep_symbols + normalized_scalp
+        ))
 
         candidate_started = time.monotonic()
         quote_request_started_at = _utc(self.clock)
@@ -297,7 +326,73 @@ class DirectSnapshotCollector:
                                 "relative_volume": historical.get("relative_volume")}
 
         indicator_started = time.monotonic()
-        benchmark_rows = [benchmark_bundle(symbol, rows.get(symbol), now=now) for symbol in ("SPY", "QQQ")]
+        analysis_now = _utc(self.clock)
+        poll_cycle_id = 'SLOW-SNAPSHOT-' + _timestamp(quote_request_started_at)
+        for symbol in requested:
+            row = quotes.get(symbol)
+            quote_at = timestamp(row.get('quote_as_of')) if row else None
+            quote = None
+            if row is not None and quote_at is not None:
+                quote = FastQuote(
+                    symbol=symbol, bid=price(row.get('bid')), ask=price(row.get('ask')),
+                    last_price=price(row.get('current_price')), timestamp=quote_at,
+                    source='DIRECT_ROBINHOOD_MCP_SLOW_SNAPSHOT',
+                    is_market_open=is_regular,
+                    received_at=quote_retrieved_at,
+                    request_started_at=quote_request_started_at,
+                    request_finished_at=quote_retrieved_at,
+                    provider_latency_seconds=timing.quote_latency_seconds,
+                    provider_status='OK', cache_hit=False,
+                    poll_cycle_id=poll_cycle_id,
+                )
+            scopes = []
+            if symbol in candidate_symbols or symbol in normalized_shadow:
+                scopes.append('POSITION')
+            if symbol in normalized_scalp:
+                scopes.append('SCALP')
+            threshold = (
+                config.SCALP_MAX_QUOTE_AGE_SECONDS
+                if 'SCALP' in scopes else config.SLOW_ANALYSIS_QUOTE_MAX_AGE_SECONDS
+            )
+            trace = quote_provenance(
+                quote, symbol=symbol, evaluation_at=analysis_now,
+                maximum_age_seconds=threshold,
+                provider_status='OK' if quote is not None else 'NO_QUOTE',
+                poll_cycle_id=poll_cycle_id,
+                previous_exchange_timestamp=self._last_exchange_timestamp.get(symbol),
+            )
+            previous_poll = self._last_quote_poll_at.get(symbol)
+            trace.update({
+                'request_context': 'SLOW_SNAPSHOT',
+                'strategy_scopes': scopes,
+                'batch_size': len(requested), 'provider_concurrency': 1,
+                'full_universe_cycle_duration_seconds': timing.quote_latency_seconds,
+                'poll_interval_since_previous_seconds': (
+                    (analysis_now-previous_poll).total_seconds() if previous_poll else None
+                ),
+                'freshness_by_strategy': {
+                    'POSITION': bool(
+                        quote and 0 <= quote.age_at(analysis_now)
+                        <= config.SLOW_ANALYSIS_QUOTE_MAX_AGE_SECONDS
+                    ),
+                    'SCALP': bool(
+                        quote and 0 <= quote.age_at(analysis_now)
+                        <= config.SCALP_MAX_QUOTE_AGE_SECONDS
+                    ),
+                },
+                'freshness_thresholds_seconds': {
+                    'POSITION': config.SLOW_ANALYSIS_QUOTE_MAX_AGE_SECONDS,
+                    'SCALP': config.SCALP_MAX_QUOTE_AGE_SECONDS,
+                },
+            })
+            event(
+                self.quote_provenance_path, 'QUOTE_REQUEST_TRACE', analysis_now,
+                max_bytes=config.QUOTE_PROVENANCE_LOG_MAX_BYTES, **trace,
+            )
+            self._last_quote_poll_at[symbol] = analysis_now
+            if quote is not None:
+                self._last_exchange_timestamp[symbol] = quote.timestamp
+        benchmark_rows = [benchmark_bundle(symbol, rows.get(symbol), now=analysis_now) for symbol in ("SPY", "QQQ")]
         direction = _market_direction(benchmark_rows)
         cache = InstrumentMetadataCache(
             self.metadata_cache_path, now=now
@@ -311,7 +406,9 @@ class DirectSnapshotCollector:
                 market_direction=direction,
                 cache=cache,
                 failure=failures.get(symbol),
-                now=now,
+                now=analysis_now,
+                max_quote_age_seconds=config.SLOW_ANALYSIS_QUOTE_MAX_AGE_SECONDS,
+                strategy_id="MOMENTUM",
             )
             for symbol in candidate_symbols
         ]
@@ -323,9 +420,25 @@ class DirectSnapshotCollector:
                 market_direction=direction,
                 cache=cache,
                 failure=failures.get(symbol),
-                now=now,
+                now=analysis_now,
+                max_quote_age_seconds=config.SLOW_ANALYSIS_QUOTE_MAX_AGE_SECONDS,
+                strategy_id=None,
             )
             for symbol in normalized_shadow
+        ]
+        scalp_data = [
+            candidate_bundle(
+                symbol,
+                rows.get(symbol),
+                scanner_row=scanner_lookup.get(symbol),
+                market_direction=direction,
+                cache=cache,
+                failure=failures.get(symbol),
+                now=analysis_now,
+                max_quote_age_seconds=config.SCALP_MAX_QUOTE_AGE_SECONDS,
+                strategy_id="SCALP",
+            )
+            for symbol in normalized_scalp
         ]
         timing.indicator_calculation_latency_seconds = time.monotonic() - indicator_started
         print("LOCAL INDICATORS: OK")
@@ -357,13 +470,16 @@ class DirectSnapshotCollector:
             },
             "scanner": scanner,
             "candidate_data": candidate_data,
+            "scalp_candidate_data": scalp_data,
             "shadow_position_data": shadow_data,
             "connectivity_checks": {},
             "warnings": warnings,
             "errors": [],
         }
         timing.snapshot_normalization_latency_seconds = time.monotonic() - normalize_started
-        partial_candidates = any(symbol in failures for symbol in deep_symbols)
+        partial_candidates = any(
+            symbol in failures for symbol in dict.fromkeys(deep_symbols + normalized_scalp)
+        )
         return snapshot, "CANDIDATE_COLLECTION_PARTIAL" if partial_candidates else "OK"
 
     def _validate(self, snapshot: Mapping[str, Any]) -> None:
@@ -405,7 +521,8 @@ class DirectSnapshotCollector:
                         "lifecycle_action": "NOT_ATTEMPTED", "criteria": [],
                         "sort_configuration": {"column": None, "direction": None},
                         "result_count": 0, "candidates": []},
-            "candidate_data": [], "shadow_position_data": [], "connectivity_checks": {},
+            "candidate_data": [], "scalp_candidate_data": [],
+            "shadow_position_data": [], "connectivity_checks": {},
             "warnings": [], "errors": [bridge_status],
         }
         atomic_json(self.snapshot_path, snapshot)

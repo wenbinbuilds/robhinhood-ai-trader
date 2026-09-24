@@ -19,6 +19,7 @@ from execution.pre_execution import PreExecutionRiskContext, PreExecutionValidat
 from shadow.execution import ShadowExecutionEngine
 from watcher.models import FastQuote, timestamp
 from watcher.storage import event
+from strategies.identity import strategy_display_name
 
 
 def _clamp(value: float) -> float:
@@ -139,6 +140,7 @@ class FastCandidateWatcher:
         pre_execution_validator: PreExecutionValidator | None = None,
         clock=None,
         rl_shadow_runtime=None,
+        debug=False,
     ) -> None:
         if config.MODE != "SHADOW_TRADING":
             raise ValueError("candidate watcher is local SHADOW_TRADING only")
@@ -159,6 +161,7 @@ class FastCandidateWatcher:
             raise ValueError("candidate watcher and runtime must share CandidateStateStore")
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.rl_shadow_runtime = rl_shadow_runtime
+        self.debug = bool(debug)
         if event_orchestrator is not None:
             event_orchestrator.bus.subscribe(EventType.QUOTE, self._on_quote_event)
         self.transitions: list[dict[str, Any]] = []
@@ -213,7 +216,30 @@ class FastCandidateWatcher:
                 if context.expired_at(now):
                     continue
                 if self.engine.portfolio.has_symbol(symbol):
-                    self.store.contexts.pop(symbol, None)
+                    existing = next(
+                        (item for item in self.engine.portfolio.snapshot().open_positions
+                         if item.symbol == symbol),
+                        None,
+                    )
+                    existing_strategy = strategy_display_name(
+                        (existing.strategy_id or existing.strategy) if existing else None
+                    )
+                    reason = (
+                        'DUPLICATE_POSITION' if existing_strategy == 'POSITION'
+                        else 'EXISTING_POSITION_OTHER_STRATEGY'
+                    )
+                    context.status = 'ENTRY_BLOCKED'
+                    context.metadata['position_blocker'] = {
+                        'reason': reason,
+                        'blocker': 'BLOCKED_BY_EXISTING_POSITION',
+                        'existing_strategy': existing_strategy,
+                        'requested_strategy': 'POSITION',
+                    }
+                    event(
+                        self.events_path, 'SHADOW_ENTRY_BLOCKED', now,
+                        symbol=symbol, reason=reason,
+                        existing_strategy=existing_strategy,
+                    )
                     continue
                 quote = quotes.get(symbol)
                 if quote is not None and self.event_orchestrator is not None and publish_quote_event:
@@ -275,8 +301,9 @@ class FastCandidateWatcher:
                 if self.rl_shadow_runtime is not None:
                     rl_action, comparison = self.rl_shadow_runtime.decide(
                         context, quote, now=now, baseline_action=baseline_action)
-                    print(f"[{context.symbol} episode={context.episode_id}] BASELINE_ACTION={baseline_action.name} "
-                          f"RL_ACTION={rl_action.name} mode={config.RL_MODE}", flush=True)
+                    if self.debug:
+                        print(f"[{context.symbol} episode={context.episode_id}] BASELINE_ACTION={baseline_action.name} "
+                              f"RL_ACTION={rl_action.name} mode={config.RL_MODE}", flush=True)
                     if config.RL_MODE == 'SHADOW_CONTROL':
                         if rl_action == EntryAction.IGNORE_SETUP:
                             self._transition_context(context, 'EXPIRED', now, 'RL_IGNORE_SETUP')
@@ -318,7 +345,7 @@ class FastCandidateWatcher:
                         else:
                             self.event_orchestrator.risk(symbol, now=now, approved=False, reason=reason)
                     event(self.events_path, "SHADOW_ENTRY_BLOCKED", now, symbol=symbol, reason=reason)
-                    print(f"{symbol} ENTRY BLOCKED: {reason}", flush=True)
+                    print(f"[POSITION ENTRY REJECTED] {symbol} reason={reason}", flush=True)
                     continue
                 transition = {"symbol": symbol, "from": "WATCH", "to": "TRADE_CANDIDATE", "final": "SHADOW_POSITION", "dynamic_score": dynamic}
                 transitions.append(transition)
@@ -326,7 +353,11 @@ class FastCandidateWatcher:
                     self.event_orchestrator.risk(symbol, now=now, approved=True)
                     self.event_orchestrator.position_opened(symbol, now=now, trade_id=opened.trade_id)
                 event(self.events_path, "WATCH_TO_SHADOW_POSITION", now, symbol=symbol, dynamic_score=round(dynamic, 6))
-                print(f"{symbol} LIVE SCORE: {live.score:.3f}\nDYNAMIC SCORE: {dynamic:.3f}\nSTATUS: WATCH → TRADE_CANDIDATE → SHADOW_POSITION", flush=True)
+                print(
+                    f"[POSITION ENTRY] {symbol} live_score={live.score:.3f} "
+                    f"dynamic_score={dynamic:.3f} SHADOW_POSITION",
+                    flush=True,
+                )
                 self.store.contexts.pop(symbol, None)
             self.store.generated_at = now.astimezone(timezone.utc).isoformat()
             self.store.save()
@@ -422,21 +453,22 @@ class FastCandidateWatcher:
         event(self.events_path, "PRE_EXECUTION_REFRESH", now, **log_fields)
         self.engine.portfolio.journal.validation(refreshed)
         gate_summary = refreshed.log_record.get("hard_gate_summary", {})
-        print(
-            f"{context.symbol} episode={context.episode_id} ENTRY REVALIDATION "
-            f"entry={refreshed.log_record.get('refreshed_entry')} "
-            f"stop={refreshed.log_record.get('refreshed_stop_loss')} "
-            f"target={refreshed.log_record.get('refreshed_take_profit')} "
-            f"bid={refreshed.log_record.get('refreshed_bid')} "
-            f"ask={refreshed.log_record.get('refreshed_ask')} "
-            f"spread={refreshed.log_record.get('refreshed_spread_percent')} "
-            f"quote_age={refreshed.quote_age_seconds} "
-            f"context_age={refreshed.log_record.get('context_age_seconds')} "
-            f"required_fields={refreshed.log_record.get('required_fields_status')} "
-            f"missing={refreshed.log_record.get('missing_required_fields')} "
-            f"hard_gates={gate_summary}",
-            flush=True,
-        )
+        if self.debug:
+            print(
+                f"{context.symbol} episode={context.episode_id} ENTRY REVALIDATION "
+                f"entry={refreshed.log_record.get('refreshed_entry')} "
+                f"stop={refreshed.log_record.get('refreshed_stop_loss')} "
+                f"target={refreshed.log_record.get('refreshed_take_profit')} "
+                f"bid={refreshed.log_record.get('refreshed_bid')} "
+                f"ask={refreshed.log_record.get('refreshed_ask')} "
+                f"spread={refreshed.log_record.get('refreshed_spread_percent')} "
+                f"quote_age={refreshed.quote_age_seconds} "
+                f"context_age={refreshed.log_record.get('context_age_seconds')} "
+                f"required_fields={refreshed.log_record.get('required_fields_status')} "
+                f"missing={refreshed.log_record.get('missing_required_fields')} "
+                f"hard_gates={gate_summary}",
+                flush=True,
+            )
         if not refreshed.approved or refreshed.plan is None:
             return None, {
                 "symbol": context.symbol,

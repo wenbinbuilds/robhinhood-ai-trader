@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from statistics import mean
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -142,6 +143,8 @@ def candidate_bundle(
     cache: InstrumentMetadataCache,
     failure: str | None = None,
     now: datetime | None = None,
+    max_quote_age_seconds: float | None = None,
+    strategy_id: str | None = None,
 ) -> dict[str, Any]:
     raw = raw or {}
     indicators = calculate_indicators(
@@ -156,18 +159,53 @@ def candidate_bundle(
     else:
         cache.update(symbol, sector, industry)
     relative_volume = number(raw.get("relative_volume"))
+    relative_volume_source = "PROVIDER"
+    if relative_volume is None and strategy_id == "SCALP":
+        completed = indicators.get("candles", [])
+        recent_volumes = [
+            number(row.get("volume")) for row in completed[-6:]
+            if isinstance(row, Mapping) and number(row.get("volume")) is not None
+        ]
+        baseline = mean(recent_volumes[:-1]) if len(recent_volumes) >= 2 else None
+        if baseline and baseline > 0:
+            relative_volume = recent_volumes[-1] / baseline
+            relative_volume_source = "COMPLETED_MICRO_BAR_RATIO"
     if relative_volume is None and scanner_row is not None:
         relative_volume = number(scanner_row.get("relative_volume"))
+        relative_volume_source = "MOMENTUM_SCANNER"
+    if relative_volume is None:
+        relative_volume_source = "UNAVAILABLE"
     unavailable = set(str(item) for item in raw.get("unavailable_values", []) if isinstance(item, str))
+    quote_at = raw.get("quote_as_of") if isinstance(raw.get("quote_as_of"), str) else None
+    quote_age = None
+    if now is not None and quote_at:
+        try:
+            parsed_quote_at = datetime.fromisoformat(quote_at.replace("Z", "+00:00"))
+            if parsed_quote_at.tzinfo is not None:
+                quote_age = (now.astimezone(timezone.utc) - parsed_quote_at.astimezone(timezone.utc)).total_seconds()
+        except (TypeError, ValueError):
+            pass
+    provider_status = "UNAVAILABLE" if failure or not raw else "OK"
+    if provider_status != "OK" or quote_age is None:
+        quote_status = "UNAVAILABLE"
+    elif quote_age < 0 or (max_quote_age_seconds is not None and quote_age > max_quote_age_seconds):
+        quote_status = "STALE"
+    else:
+        quote_status = "FRESH"
     values = {
         "symbol": symbol,
+        "strategy_id": strategy_id,
         "current_price": number(raw.get("current_price")), "bid": number(raw.get("bid")), "ask": number(raw.get("ask")),
-        "quote_as_of": raw.get("quote_as_of") if isinstance(raw.get("quote_as_of"), str) else None,
+        "quote_as_of": quote_at,
         "quote_timestamp_field": raw.get("quote_timestamp_field") if isinstance(raw.get("quote_timestamp_field"), str) else None,
         "quote_request_started_at": raw.get("quote_request_started_at") if isinstance(raw.get("quote_request_started_at"), str) else None,
         "candidate_quote_retrieved_at": raw.get("quote_retrieved_at") if isinstance(raw.get("quote_retrieved_at"), str) else None,
         "quote_freshness_source": raw.get("quote_freshness_source") if raw.get("quote_freshness_source") in {"exchange_timestamp", "retrieval_timestamp", "unavailable"} else "unavailable",
+        "provider_status": provider_status,
+        "quote_status": quote_status,
+        "quote_age_seconds": quote_age,
         "volume": indicators["volume"], "relative_volume": relative_volume,
+        "relative_volume_source": relative_volume_source,
         "vwap": indicators["vwap"], "ema9": indicators["ema9"], "ema20": indicators["ema20"],
         "rsi14": indicators["rsi14"], "macd": indicators["macd"], "macd_signal": indicators["macd_signal"],
         "macd_histogram": indicators["macd_histogram"],
@@ -181,7 +219,7 @@ def candidate_bundle(
         "collection_error": failure,
     }
     for name, value in values.items():
-        if name not in {"symbol", "market_direction", "sector", "industry", "sector_benchmark", "news_items", "candles", "level2", "collection_status", "collection_error"} and value is None:
+        if name not in {"symbol", "strategy_id", "market_direction", "sector", "industry", "sector_benchmark", "news_items", "candles", "level2", "collection_status", "collection_error", "provider_status", "quote_status", "relative_volume_source"} and value is None:
             unavailable.add(name)
     unavailable.update(("level2", "sector_benchmark", "snapshot_news_deferred_to_reasoning"))
     values["unavailable_values"] = sorted(unavailable)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from math import isfinite
 from typing import Any, Mapping
 
 import config
@@ -47,7 +48,11 @@ class CoordinatorAgent:
             news_score = news.score
             sector_score = sector.score
             market_score = market.score
-            qualitative_score = 0.0
+            # Missing qualitative evidence is not negative evidence.  The
+            # separate deterministic veto below still fails closed, while the
+            # diagnostic score remains semantically neutral instead of being
+            # silently converted to zero quality.
+            qualitative_score = 0.5
         else:
             news_score = self._llm_news_score(llm_analysis)
             sector_score = self._bias_score(
@@ -64,13 +69,30 @@ class CoordinatorAgent:
                 + 0.15 * (1.0 - qualitative.conflicting_evidence_severity)
             )
         scores = {
-            "technical": technical.context.technical_score,
-            "news": news_score,
-            "sector": sector_score,
-            "market": market_score,
-            "qualitative": qualitative_score,
+            "technical": self._bounded_score(
+                technical.context.technical_score, "technical"
+            ),
+            "news": self._bounded_score(news_score, "news"),
+            "sector": self._bounded_score(sector_score, "sector"),
+            "market": self._bounded_score(market_score, "market"),
+            "qualitative": self._bounded_score(
+                qualitative_score, "qualitative"
+            ),
         }
         combined = sum(scores[key] * self.weights[key] for key in self.weights)
+        score_breakdown = {
+            key: {
+                "value": scores[key],
+                "semantic": (
+                    "0=negative, 0.5=neutral, 1=positive"
+                    if key != "technical"
+                    else "0=weak, 0.5=monitorable, 1=strong"
+                ),
+                "weight": self.weights[key],
+                "contribution": scores[key] * self.weights[key],
+            }
+            for key in self.weights
+        }
         reasons_for = [
             *technical.context.evidence,
             *(news.event_clusters[0].summary.splitlines()[:1] if news.event_clusters else []),
@@ -196,6 +218,7 @@ class CoordinatorAgent:
             technical_confidence=round(float(technical.context.confidence), 3),
             true_hard_gate_failures=tuple(true_hard_failures),
             signal_quality_failures=tuple(signal_quality_failures),
+            score_breakdown=score_breakdown,
         )
 
     @staticmethod
@@ -205,6 +228,16 @@ class CoordinatorAgent:
         except (TypeError, ValueError):
             return None
         return result if result == result else None
+
+    @staticmethod
+    def _bounded_score(value: Any, name: str) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} score must be a finite number") from exc
+        if not isfinite(result) or not 0.0 <= result <= 1.0:
+            raise ValueError(f"{name} score must be within [0, 1]")
+        return result
 
     @staticmethod
     def _bias_score(value: str) -> float:

@@ -56,6 +56,8 @@ def normalize_candles(
             "begins_at": str(value["begins_at"]),
             **{name: float(number) for name, number in numbers.items()},
             "interpolated": False,
+            "interval_seconds": _finite(value.get("interval_seconds")) or 300.0,
+            "bar_source": str(value.get("bar_source") or "PROVIDER_HISTORY"),
         })
     ordered = [item[1] for item in sorted(rows.values(), key=lambda item: item[0])]
     return ordered[-limit:] if limit is not None else ordered
@@ -121,7 +123,8 @@ def calculate_indicators(
         now_utc = (now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
         candles = [
             item for item in candles
-            if (_timestamp(item["begins_at"]).astimezone(timezone.utc) + timedelta(minutes=5)) <= now_utc
+            if (_timestamp(item["begins_at"]).astimezone(timezone.utc)
+                + timedelta(seconds=item.get("interval_seconds", 300.0))) <= now_utc
         ]
     closes = [item["close"] for item in candles]
     ema9_values = ema_series(closes, 9)

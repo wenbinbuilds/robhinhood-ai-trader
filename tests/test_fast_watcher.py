@@ -135,6 +135,36 @@ def test_stale_or_future_quote_never_marks_or_exits(tmp_path, offset):
     assert "FAST_QUOTE_STALE" in w.events_path.read_text()
 
 
+def test_provider_success_and_scalp_freshness_are_reported_separately(tmp_path):
+    portfolio = ShadowPortfolio(tmp_path/'portfolio.json', tmp_path/'trades.jsonl')
+    engine = ShadowExecutionEngine(portfolio)
+
+    class ScalpProbe:
+        def __init__(self): self.observed = None
+        def symbols(self, now): return ['ACME']
+        def on_quotes(self, quotes, *, now, entry_quotes, quote_quality):
+            self.observed = (quotes, entry_quotes, quote_quality)
+            return {'exits': [], 'entries': [], 'diagnostics': {
+                'universe': 1, 'provider_ok': 1, 'fresh_quotes': 0,
+                'spread_pass': 0, 'liquidity_pass': 0,
+                'micro_signal_candidates': 0, 'entries': 0,
+            }}
+
+    probe = ScalpProbe()
+    watcher = FastPositionWatcher(
+        portfolio, Quotes(at=NOW-timedelta(seconds=3)), ShadowExecutor(engine),
+        status_path=tmp_path/'status.json', events_path=tmp_path/'events.jsonl',
+        clock=lambda: NOW, scalp_runtime=probe,
+    )
+    watcher.tick()
+    _fresh, observed, quality = probe.observed
+    assert 'ACME' in observed
+    assert quality['ACME']['provider_status'] == 'OK'
+    assert quality['ACME']['quote_status'] == 'STALE'
+    assert quality['ACME']['quote_age_seconds'] == 3
+    assert watcher.status['quote_quality']['ACME']['quote_status'] == 'STALE'
+
+
 def test_provider_error_sanitized_and_does_not_exit(tmp_path):
     class Broken(Quotes):
         def get_quotes(self, symbols):

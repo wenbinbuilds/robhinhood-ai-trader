@@ -29,6 +29,16 @@ class FastQuote:
     source: str
     is_market_open: bool | None
     session_close: datetime | None = None
+    received_at: datetime | None = None
+    request_started_at: datetime | None = None
+    request_finished_at: datetime | None = None
+    provider_latency_seconds: float | None = None
+    provider_status: str = 'OK'
+    cache_hit: bool = False
+    cache_key: str | None = None
+    cache_created_at: datetime | None = None
+    cache_expiry: datetime | None = None
+    poll_cycle_id: str | None = None
 
     @property
     def mid_price(self) -> float | None:

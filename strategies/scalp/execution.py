@@ -10,9 +10,11 @@ import config
 from execution.models import TradePlan
 from risk.risk_manager import RiskLimits, RiskManager, RiskRequest
 from shadow.execution import ShadowExecutionEngine
+from execution.execution_guard import read_kill_switch
 from strategies.scalp.events import ScalpEventJournal
 from strategies.scalp.setup import ScalpSetupController
 from strategies.scalp.signals import ScalpSignalEngine, completed_micro_bars
+from strategies.identity import is_scalp_strategy, strategy_display_name
 
 
 def scalp_risk_manager():
@@ -26,29 +28,42 @@ def scalp_risk_manager():
 
 class ScalpEntryController:
     def __init__(self, portfolio, *, setup_path=config.SCALP_STATE_PATH,
-                 events_path=config.SCALP_EVENT_LOG_PATH, signal_engine=None):
+                 events_path=config.SCALP_EVENT_LOG_PATH, signal_engine=None,
+                 enabled=None, kill_switch_path=None):
         self.portfolio = portfolio
         self.signal_engine = signal_engine or ScalpSignalEngine()
         self.setup_controller = ScalpSetupController(setup_path)
         self.events = ScalpEventJournal(events_path)
         self.risk_manager = scalp_risk_manager()
         self.engine = ShadowExecutionEngine(portfolio, risk_manager=self.risk_manager)
+        self.enabled = config.SCALP_ENABLED if enabled is None else bool(enabled)
+        self.kill_switch_path = Path(kill_switch_path or config.LIVE_KILL_SWITCH_PATH)
 
     def process(self, symbol, quote, market_data: Mapping, *, now):
-        if not config.SCALP_ENABLED:
+        if not self.enabled:
             return None, {'symbol': symbol, 'reason': 'SCALP_DISABLED'}
         if config.MODE != 'SHADOW_TRADING' or config.SCALP_MODE != 'SHADOW':
             return None, {'symbol': symbol, 'reason': 'SCALP_SHADOW_ONLY'}
+        if config.LIVE_TRADING_ENABLED is not False or config.ROBINHOOD_EXECUTION_ENABLED is not False:
+            return None, {'symbol': symbol, 'reason': 'SCALP_SAFETY_FLAGS_INVALID'}
+        if not read_kill_switch(self.kill_switch_path).trading_blocked:
+            return None, {'symbol': symbol, 'reason': 'SCALP_KILL_SWITCH_NOT_BLOCKED'}
         bars = completed_micro_bars(market_data.get('candles', []) or [], now)
         features = self.signal_engine.features(symbol, quote, market_data, now=now)
         setup_type, evidence = self.signal_engine.classify(features, bars)
         evidence_at = bars[-1]['begins_at'] if bars else now.astimezone(timezone.utc).isoformat()
         episode = self.setup_controller.episode(
             symbol, setup_type, evidence, evidence_at, features, now=now)
+        episode_lifecycle = self._episode_lifecycle(episode, now)
         self.events.emit('ScalpCandidateDetected', timestamp=now, symbol=symbol,
                          episode_id=episode.episode_id, setup_type=setup_type)
         if episode.state == 'CLOSED':
-            return None, {'symbol': symbol, 'reason': 'STALE_SCALP_EPISODE', 'episode_id': episode.episode_id}
+            return None, {'symbol': symbol, 'reason': 'STALE_SCALP_EPISODE',
+                          'episode_id': episode.episode_id,
+                          'setup_type': setup_type,
+                          'setup_evidence': list(evidence),
+                          'episode_lifecycle': episode_lifecycle,
+                          'entry_attempted': False}
         decision = self.signal_engine.evaluate(
             episode.episode_id, symbol, quote, market_data, now=now)
         guard_reasons = self._session_limits(symbol, now)
@@ -58,12 +73,16 @@ class ScalpEntryController:
                              episode_id=episode.episode_id, reasons=list(reasons),
                              decision=decision.to_dict())
             return None, {'symbol': symbol, 'reason': reasons[0], 'reasons': list(reasons),
-                          'decision': decision}
+                          'decision': decision, 'episode_id': episode.episode_id,
+                          'episode_lifecycle': episode_lifecycle,
+                          'entry_attempted': False, 'risk_attempted': False}
         self.events.emit('ScalpEntryReady', timestamp=now, symbol=symbol,
                          episode_id=episode.episode_id, decision=decision.to_dict())
         snapshot = self.portfolio.snapshot()
-        allocated = sum(p.notional_value for p in snapshot.open_positions
-                        if p.strategy in {'SCALP', config.SCALP_STRATEGY_ID})
+        allocated = sum(
+            p.notional_value for p in snapshot.open_positions
+            if is_scalp_strategy(p.strategy_id or p.strategy)
+        )
         scalp_buying_power = max(0.0, min(snapshot.cash,
             snapshot.equity*config.SCALP_CAPITAL_ALLOCATION_PERCENT-allocated))
         risk = self.risk_manager.evaluate(RiskRequest(
@@ -74,7 +93,18 @@ class ScalpEntryController:
         if not risk.approved or risk.max_shares < 1:
             self.events.emit('ScalpEntryBlocked', timestamp=now, symbol=symbol,
                 episode_id=episode.episode_id, reasons=list(risk.reasons), gate='RISK')
-            return None, {'symbol': symbol, 'reason': 'SCALP_RISK_REJECTED', 'details': list(risk.reasons)}
+            print(
+                f"[SCALP RISK REJECTION] {symbol} episode={episode.episode_id} "
+                f"reasons={','.join(risk.reasons) or 'MAX_SHARES_BELOW_ONE'}",
+                flush=True,
+            )
+            return None, {'symbol': symbol, 'reason': 'SCALP_RISK_REJECTED',
+                          'reasons': ['SCALP_RISK_REJECTED'],
+                          'details': list(risk.reasons), 'decision': decision,
+                          'episode_id': episode.episode_id,
+                          'episode_lifecycle': episode_lifecycle,
+                          'entry_attempted': True, 'risk_attempted': True,
+                          'risk_approved': False, 'risk': risk.to_dict()}
         quantity = risk.max_shares
         plan = TradePlan(
             trade_id=str(uuid5(NAMESPACE_URL, 'shadow-entry:'+episode.episode_id)),
@@ -100,26 +130,61 @@ class ScalpEntryController:
         if position is None:
             self.events.emit('ScalpEntryBlocked', timestamp=now, symbol=symbol,
                 episode_id=episode.episode_id, reasons=[detail.get('reason')], gate='EXECUTION')
-            return None, detail
+            print(
+                f"[SCALP ENTRY REJECTED] {symbol} episode={episode.episode_id} "
+                f"reason={detail.get('reason', 'EXECUTION_REJECTED')}",
+                flush=True,
+            )
+            return None, {**detail, 'decision': decision,
+                          'episode_id': episode.episode_id,
+                          'episode_lifecycle': episode_lifecycle,
+                          'entry_attempted': True, 'risk_attempted': True,
+                          'risk_approved': True, 'risk': risk.to_dict(),
+                          'pre_execution_attempted': True}
         self.events.emit('ScalpPositionOpened', timestamp=now, symbol=symbol,
             episode_id=episode.episode_id, trade_id=position.trade_id,
             entry=position.entry_price, stop=position.stop, target=position.target)
-        print(f"[SCALP {symbol} episode={episode.episode_id}] setup={decision.setup_type} "
+        print(f"[SCALP ENTRY] {symbol} episode={episode.episode_id} setup={decision.setup_type} "
               f"spread={(decision.features.spread_pct or 0)*100:.3f}% "
               f"expected_move={(decision.expected_move_pct or 0)*100:.3f}% "
               f"cost={(decision.estimated_cost_pct or 0)*100:.3f}% "
               f"net_edge={(decision.expected_net_edge_pct or 0)*100:.3f}% "
               f"entry={position.entry_price:.4f} stop={position.stop:.4f} "
               f"target={position.target:.4f} SHADOW_ENTRY", flush=True)
-        return position, {'status': 'OPENED', 'strategy_id': 'SCALP',
+        return position, {'status': 'OPENED', 'strategy_id': position.strategy_id,
+                          'strategy_display_name': 'SCALP',
                           'trade_id': position.trade_id, 'episode_id': episode.episode_id,
-                          'decision': decision, **detail}
+                          'decision': decision,
+                          'episode_lifecycle': episode_lifecycle,
+                          'entry_attempted': True,
+                          'risk_attempted': True, 'risk_approved': True,
+                          'pre_execution_attempted': True, **detail}
+
+    @staticmethod
+    def _episode_lifecycle(episode, now):
+        try:
+            created = datetime.fromisoformat(episode.created_at.replace('Z', '+00:00'))
+            age = (now.astimezone(timezone.utc)-created.astimezone(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, AttributeError):
+            age = None
+        return {
+            'episode_status': episode.state,
+            'episode_created_at': episode.created_at,
+            'episode_last_updated_at': episode.last_updated_at,
+            'episode_age_seconds': age,
+            'stale_after_seconds': episode.stale_after_seconds,
+            'initial_structural_fingerprint': episode.initial_structural_fingerprint,
+            'current_structural_fingerprint': episode.structural_fingerprint,
+            'structure_changed': episode.structure_changed,
+            'new_episode_allowed': episode.new_episode_allowed,
+            'reason_stale': episode.stale_reason,
+        }
 
     def _session_trades(self, now):
         zone = ZoneInfo(config.MARKET_TIMEZONE)
         day = now.astimezone(zone).date()
         return [t for t in self.portfolio.snapshot().closed_positions
-                if t.strategy in {'SCALP', config.SCALP_STRATEGY_ID}
+                if is_scalp_strategy(t.strategy_id or t.strategy)
                 and datetime.fromisoformat(t.exit_timestamp.replace('Z','+00:00')).astimezone(zone).date() == day]
 
     def _session_limits(self, symbol, now):
@@ -145,7 +210,27 @@ class ScalpEntryController:
     def on_quotes(self, quotes, data_lookup, *, now):
         results = []
         for symbol, quote in quotes.items():
-            if self.portfolio.has_symbol(symbol): continue
+            existing = next((
+                item for item in self.portfolio.snapshot().open_positions
+                if item.symbol == symbol.upper()
+            ), None)
+            if existing is not None:
+                existing_strategy = strategy_display_name(
+                    existing.strategy_id or existing.strategy
+                )
+                reason = (
+                    'DUPLICATE_POSITION' if existing_strategy == 'SCALP'
+                    else 'EXISTING_POSITION_OTHER_STRATEGY'
+                )
+                results.append({'symbol': symbol, 'reason': reason,
+                                'reasons': [reason],
+                                'blocker': 'BLOCKED_BY_EXISTING_POSITION',
+                                'existing_strategy': existing_strategy,
+                                'requested_strategy': 'SCALP',
+                                'entry_attempted': False,
+                                'portfolio_attempted': False,
+                                'portfolio_approved': False})
+                continue
             position, detail = self.process(symbol, quote, data_lookup(symbol) or {}, now=now)
             results.append(detail)
         return results

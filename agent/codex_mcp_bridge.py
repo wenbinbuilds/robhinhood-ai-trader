@@ -598,12 +598,16 @@ class CodexMcpBridge:
         scanner_lookup = {row["symbol"]: row for row in ranked}
         candidate_data = [
             candidate_bundle(symbol, data_rows.get(symbol), scanner_row=scanner_lookup.get(symbol),
-                             market_direction="UNKNOWN", cache=cache, failure=data_failures.get(symbol), now=merge_now)
+                             market_direction="UNKNOWN", cache=cache, failure=data_failures.get(symbol), now=merge_now,
+                             max_quote_age_seconds=config.SLOW_ANALYSIS_QUOTE_MAX_AGE_SECONDS,
+                             strategy_id="MOMENTUM")
             for symbol in candidate_symbols
         ]
         shadow_data = [
             candidate_bundle(symbol, data_rows.get(symbol), scanner_row=scanner_lookup.get(symbol),
-                             market_direction="UNKNOWN", cache=cache, failure=data_failures.get(symbol), now=merge_now)
+                             market_direction="UNKNOWN", cache=cache, failure=data_failures.get(symbol), now=merge_now,
+                             max_quote_age_seconds=config.SLOW_ANALYSIS_QUOTE_MAX_AGE_SECONDS,
+                             strategy_id=None)
             for symbol in normalized_shadow
         ]
         snapshot: dict[str, Any] = {
@@ -614,6 +618,7 @@ class CodexMcpBridge:
             "positions": core["positions"], "open_orders": core["open_orders"],
             "daily_realized_pnl": core["daily_realized_pnl"], "market": market,
             "scanner": scanner, "candidate_data": candidate_data,
+            "scalp_candidate_data": [],
             "shadow_position_data": shadow_data,
             "connectivity_checks": {},
             "warnings": list(core.get("warnings", []))
@@ -623,7 +628,7 @@ class CodexMcpBridge:
         try:
             snapshot = self._normalize_snapshot(snapshot)
             direction = snapshot["market"]["direction"]
-            for section in ("candidate_data", "shadow_position_data"):
+            for section in ("candidate_data", "scalp_candidate_data", "shadow_position_data"):
                 for row in snapshot[section]:
                     row["market_direction"] = direction
             parse_done = time.monotonic()
@@ -855,7 +860,7 @@ class CodexMcpBridge:
                 "daily_realized_pnl": confirmed_core["daily_realized_pnl"],
                 "market": {**market, "direction": "UNKNOWN", "benchmarks": [], "volatility_context": None},
                 "scanner": final_scanner(confirmed_core, ranked),
-                "candidate_data": [], "shadow_position_data": [],
+                "candidate_data": [], "scalp_candidate_data": [], "shadow_position_data": [],
                 "connectivity_checks": {}, "warnings": [], "errors": [detail],
             }
             self._write_snapshot(snapshot)
@@ -1111,7 +1116,7 @@ class CodexMcpBridge:
             direction = "MIXED"
         market_copy["direction"] = direction
         normalized["market"] = market_copy
-        for section in ("candidate_data", "shadow_position_data"):
+        for section in ("candidate_data", "scalp_candidate_data", "shadow_position_data"):
             rows = normalized.get(section, [])
             if isinstance(rows, list):
                 normalized[section] = [
@@ -1314,6 +1319,16 @@ def diagnostic_lines(
         if isinstance(scanner, Mapping)
         else "UNAVAILABLE"
     )
+    scan_age = None
+    if isinstance(scanner, Mapping):
+        try:
+            queried = datetime.fromisoformat(
+                str(scanner.get("query_executed_at", "")).replace("Z", "+00:00")
+            )
+            if queried.tzinfo is not None:
+                scan_age = max(0.0, (datetime.now(timezone.utc) - queried.astimezone(timezone.utc)).total_seconds())
+        except (TypeError, ValueError):
+            pass
     position_count: int | str = (
         len(positions)
         if isinstance(positions, Sequence) and not isinstance(positions, (str, bytes))
@@ -1348,6 +1363,46 @@ def diagnostic_lines(
             f"SCAN RESULTS: {scanner_results}",
         ]
     )
+    if isinstance(scanner, Mapping) and scanner.get("status") == "OK":
+        provider_raw = scanner.get("provider_raw_count", scanner_results)
+        after_provider = scanner.get("after_provider_filters_count", scanner_results)
+        after_local = scanner.get("after_local_filters_count", len(scanner.get("candidates", [])))
+        top_n = scanner.get("top_n_count", len(scanner.get("candidates", [])))
+        lines.append(
+            "MOMENTUM SCANNER: "
+            f"provider_raw={provider_raw} "
+            f"saved_definitions={scanner.get('saved_definition_count', 'UNAVAILABLE')} "
+            f"after_provider_filters={after_provider} "
+            f"after_local_filters={after_local} top_n={top_n} "
+            f"scan_age={'UNAVAILABLE' if scan_age is None else f'{scan_age:.1f}s'} "
+            f"scan_config={scanner_name}"
+        )
+        lines.append(
+            "SCAN SEMANTICS: "
+            f"definition={scanner_action} "
+            f"results={scanner.get('results_source', 'UNAVAILABLE')}"
+        )
+    candidate_rows = snapshot.get("candidate_data", [])
+    if isinstance(candidate_rows, Sequence) and not isinstance(candidate_rows, (str, bytes)):
+        provider_ok = sum(
+            isinstance(row, Mapping) and row.get("provider_status") == "OK"
+            for row in candidate_rows
+        )
+        fresh = sum(
+            isinstance(row, Mapping) and row.get("quote_status") == "FRESH"
+            for row in candidate_rows
+        )
+        stale = sum(
+            isinstance(row, Mapping) and row.get("quote_status") == "STALE"
+            for row in candidate_rows
+        )
+        unavailable = len(candidate_rows) - fresh - stale
+        lines.append(
+            "MOMENTUM QUOTES: "
+            f"provider_ok={provider_ok}/{len(candidate_rows)} fresh={fresh} "
+            f"stale={stale} unavailable={unavailable} "
+            f"freshness_limit={config.SLOW_ANALYSIS_QUOTE_MAX_AGE_SECONDS}s"
+        )
     if bridge_status == "BENCHMARK_FAILED":
         lines.append("BENCHMARK: FAILED")
     if custom_mcp_configured is not None:

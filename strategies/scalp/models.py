@@ -38,6 +38,19 @@ class ScalpFeatures:
     ema20: float | None
     latest_bar_timestamp: str | None
     bar_count: int
+    micro_bar_freshness: dict[str, Any] = field(default_factory=dict)
+    feature_provenance: dict[str, Any] = field(default_factory=dict)
+    signal_data_status: str = 'UNAVAILABLE'
+    score_breakdown: dict[str, Any] = field(default_factory=dict)
+    # Canonical name; relative_volume remains a read-compatible persisted alias.
+    volume_expansion: float | None = None
+    price_timing_source: str = 'PROVIDER_5_MINUTE_CONTEXT'
+    quote_sample_count: int = 0
+    quote_window_seconds: float | None = None
+    quote_microstructure: dict[str, Any] = field(default_factory=dict)
+    # Audit metadata only. Production entry_extension above remains the value
+    # consumed by the score and hard gate.
+    entry_extension_reference: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self): return asdict(self)
 
@@ -52,6 +65,13 @@ class ScalpEpisode:
     evidence_timestamp: str
     evidence: tuple[str, ...]
     state: str = 'FORMING'
+    last_updated_at: str | None = None
+    structural_fingerprint: str | None = None
+    initial_structural_fingerprint: str | None = None
+    structure_changed: bool = False
+    new_episode_allowed: bool = True
+    stale_after_seconds: float | None = None
+    stale_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -61,7 +81,7 @@ class ScalpEntryDecision:
     symbol: str
     setup_type: str
     setup_evidence: tuple[str, ...]
-    signal_score: float
+    signal_score: float | None
     expected_move_pct: float | None
     estimated_cost_pct: float | None
     expected_net_edge_pct: float | None

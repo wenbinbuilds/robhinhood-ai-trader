@@ -11,6 +11,8 @@ EVENTS = {
     'ScalpTargetHit', 'ScalpMomentumExit', 'ScalpTimeExit',
     'ScalpPositionClosed',
     'ScalpEodExit', 'ScalpHardRiskExit', 'ScalpProfitProtectionExit',
+    'ScalpPositionRecovered', 'ScalpPositionOverdue',
+    'ScalpOverdueExitPending', 'ScalpRecoveryTimeExit',
 }
 
 

@@ -124,6 +124,7 @@ class CoordinatorDecision(StructuredModel):
     technical_confidence: float | None = None
     true_hard_gate_failures: tuple[str, ...] = ()
     signal_quality_failures: tuple[str, ...] = ()
+    score_breakdown: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

@@ -1,276 +1,454 @@
+<p align="center">
+  <img src="assets/project-banner.svg" alt="Robinhood AI Trader placeholder project banner" width="900">
+</p>
+
+> **Banner status:** The image above is a clearly marked placeholder. Create a
+> final 1600 × 400 px SVG or PNG at `assets/project-banner.svg` that includes
+> the project name, a simple market-data motif, and the words “Local Shadow
+> Trading.” Do not include account information or imply affiliation with
+> Robinhood.
+
 # Robinhood AI Trader
 
-This project is a local Robinhood research and shadow-trading system. Its
-permanent mode is currently `SHADOW_TRADING`: entries, exits, positions, cash,
-and P&L are simulated only in local files. It cannot preview, review, place,
-modify, replace, cancel, close, or submit a real order.
+Robinhood AI Trader is a local research and simulated-trading system for
+studying intraday U.S. equity strategies with Robinhood market data. It is for
+developers and technically curious traders who want an inspectable pipeline:
+the project collects factual data, evaluates candidates, applies deterministic
+risk rules, and records hypothetical entries and exits in local shadow state.
 
-The only permitted Robinhood mutation is maintenance and execution of the one
-project-owned saved scanner `AI_INTRADAY_MOMENTUM_V1`, as defined in
-`AGENTS.md`. All other Robinhood use is factual retrieval.
+The project exists to make strategy behavior observable and testable without
+turning an AI-generated idea into a real brokerage order. Its current mode is
+`SHADOW_TRADING`.
 
-## Current event-driven architecture
+> [!IMPORTANT]
+> **This project does not place real Robinhood orders.** Entries, exits,
+> positions, cash, and P&L are simulations stored locally. Live execution flags
+> are disabled, the local kill switch is blocked, and the runtime does not
+> expose an order-submission workflow.
 
-Routine factual collection no longer uses `codex exec`:
+## Table of contents
 
-```text
-DirectRobinhoodMcpClient (official Python MCP SDK, Streamable HTTP + OAuth/PKCE)
-  -> Robinhood Trading MCP
-  -> Python field allowlisting and normalization
-  -> AI_INTRADAY_MOMENTUM_V1 ranking (top 10)
-  -> one batched quote request + bounded concurrent 5-minute histories
-  -> deterministic Python EMA9/EMA20/RSI14/MACD/VWAP/session calculations
-  -> schema validation + atomic state/market_snapshot.json
-  -> event-gated LlmReasoningBridge refresh for meaningful slow evidence
-  -> deterministic CoordinatorAgent
-  -> persisted slow CandidateContext + typed CandidateStateStore (300-second TTL)
+- [What it does](#what-it-does)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Authorization](#authorization)
+- [Quickstart](#quickstart)
+- [Example session](#example-session)
+- [Demo recordings](#demo-recordings)
+- [Architecture](#architecture)
+- [Strategies and decision flow](#strategies-and-decision-flow)
+- [Safety model](#safety-model)
+- [Configuration and local data](#configuration-and-local-data)
+- [Useful commands](#useful-commands)
+- [Testing](#testing)
+- [FAQ](#faq)
 
-Fast loop (approximately every two seconds; no LLM/subprocess/web calls)
-  -> one direct batched quote request
-  -> QuoteEvent (newest quote wins per symbol under backpressure)
-  -> deterministic LiveMarketScorer
-  -> AlphaCombiner (age-weighted slow/live score)
-  -> explicit candidate state machine
-  -> hard quote/spread/market/geometry/risk validation
-  -> two consecutive qualifying updates
-  -> typed TradePlan -> portfolio construction -> local ShadowExecutor
-  -> independent FastPositionWatcher -> stop/target/close events
-```
+## What it does
 
-The in-process event bus uses these priority bands: stop/risk/position events
-are critical or high, open-position quotes are high, candidate quotes and alpha
-updates are medium, scanner/bar/context events are low, and news/LLM work is
-background. Quote events are coalesced per symbol, so a delayed consumer sees
-the newest queued quote instead of replaying stale updates. Component-handler
-failures are recorded and isolated.
+- **Collects factual market and account context.** The default provider uses
+  the Model Context Protocol (MCP) Python SDK to connect to Robinhood, run the
+  project-owned `AI_INTRADAY_MOMENTUM_V1` scanner, retrieve quotes and
+  five-minute histories, and normalize the results locally.
 
-Candidate states and legal forward path are:
+- **Runs two distinct research strategies.** `POSITION` combines a slower
+  research score with fast quote updates. Optional `SCALP` evaluates short,
+  deterministic setups without an LLM and remains shadow-only.
 
-```text
-DISCOVERED -> WATCHLIST -> SETUP_FORMING -> TRADE_READY
--> RISK_APPROVED -> POSITION_OPEN -> EXIT_PENDING -> CLOSED
-```
+- **Separates research from entry timing.** Slow analysis builds candidate
+  context. A fast loop polls quotes, updates live scores, and checks freshness,
+  spread, geometry, risk, and portfolio limits before any simulated entry.
 
-`WATCHLIST`/`SETUP_FORMING` may expire or be rejected; `SETUP_FORMING` may
-return to `WATCHLIST`; infrastructure failures have an explicit
-`INFRASTRUCTURE_BLOCKED` state. Impossible transitions raise an error. State
-and transition history are atomically persisted in
-`state/candidate_states.json`, while meaningful typed events are written to
-`logs/market_events.jsonl`. The dashboard projection exposes `UNIVERSE`,
-`WATCHLIST`, `SETUP FORMING`, `TRADE READY`, `OPEN POSITIONS`, and
-`RECENTLY CLOSED` collections.
+- **Simulates a complete trade lifecycle locally.** The shadow portfolio tracks
+  hypothetical fills, stops, targets, exits, cash, and P&L. It never treats a
+  scanner result as an automatic trade.
 
-The direct snapshot path does not run a subprocess, model, web search,
-fundamentals query, technical-indicator MCP tool, Level 2 query, or news query.
-News and qualitative context remain in a separate slow reasoning layer. The
-event-driven reasoning cache refreshes for a new completed five-minute bar,
-candidate-set change, news event, sector change, market-regime change, or
-technical disposition change. A mere quote or wall-clock change does not call
-the model, and the fast candidate and position paths cannot import it.
-Strategy thresholds, coordinator weights, and deterministic risk limits are
-unchanged.
+- **Explains what the runtime is doing.** Normal mode prints a compact dashboard
+  with open positions, top candidates, rejection reasons, and the deepest
+  current bottleneck. `--debug` retains detailed candidate and funnel traces.
 
-`agent/codex_mcp_bridge.py` remains only as the explicitly selectable
-`LEGACY_CODEX_MCP` diagnostic provider. There is no automatic fallback: a direct
-failure reports `DIRECT_MCP_UNAVAILABLE` or `DIRECT_MCP_NOT_AUTHENTICATED` and
-does not start the old multi-minute collection path.
+- **Fails closed.** Missing authentication, stale or incomplete data, invalid
+  geometry, risk rejection, and market closure are reported as blocks rather
+  than being converted into trades.
 
-## Installation and independent authorization
+## Prerequisites
 
-Python 3.12 or newer is required. Install dependencies:
+Before running the project, you need:
+
+- Python **3.12 or newer** (`runner.py` rejects older versions);
+- a Robinhood account with access to Robinhood Agentic Trading and permission
+  to complete its browser consent flow;
+- the Codex CLI installed and authenticated for the slow qualitative reasoning
+  layer; and
+- macOS, Linux, or another environment with a working Python `keyring` backend.
+  On macOS, the OAuth material is stored in the login Keychain.
+
+Run all commands from the repository root. No credentials, tokens, account
+identifiers, or cookies belong in the repository.
+
+## Installation
+
+Create an isolated environment and install the pinned dependencies:
 
 ```bash
+cd /path/to/robhinhood-ai-trader
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-The implementation pins the official Model Context Protocol Python SDK
-(`mcp==2.2.0`) and uses its Streamable HTTP OAuth client. The SDK performs MCP
-OAuth discovery, dynamic client registration, authorization-code flow with
-PKCE, state/issuer validation, and token refresh.
+The core requirements include `mcp==2.2.0`, `jsonschema`, `keyring`, and
+`pytest`. The repository also installs the dependencies used by its optional
+offline reinforcement-learning research modules.
 
-This Python application requires its own one-time Robinhood consent. It does
-not read Codex credentials, reuse Codex tokens, read browser cookies, scrape
-Robinhood, or call undocumented endpoints. On macOS, this application's OAuth
-token and dynamic client registration are stored in the login Keychain under
-service `robinhood-ai-trader.direct-mcp`; secrets are not placed in repository
-files, logs, snapshots, or reasoning prompts.
+## Authorization
 
-Run the explicit setup command:
+Authorize this Python application through Robinhood's browser consent flow:
 
 ```bash
 python runner.py --robinhood-auth
 ```
 
-It starts a localhost callback on `127.0.0.1:8765`, opens the Robinhood consent
-page, and performs authentication only. It invokes no Robinhood order tool.
-After browser consent, verify factual access:
+The command opens a browser and listens for the OAuth callback on
+`127.0.0.1:8765`. It performs authentication only; it does not invoke an order
+tool. The application does not reuse browser cookies or store OAuth secrets in
+repository files.
+
+Then verify the connection:
 
 ```bash
 python runner.py --robinhood-mcp-check
 ```
 
-The check discovers the live tool schemas, retrieves the Agentic account using
-read-only access, and requests one NVDA quote solely as connectivity evidence.
-NVDA does not enter scanner candidates or strategy decisions unless the saved
-scanner independently returns it.
+The check discovers the available safe tool schemas, verifies access to the
+Agentic account, and requests one read-only NVDA quote as connectivity
+evidence. That quote is not itself a trade signal.
 
-## Running
+## Quickstart
 
-One fresh research/shadow cycle:
+Run one fresh research cycle:
 
 ```bash
 python runner.py --once
 ```
 
-Persistent slow-cycle research plus local position monitoring:
+Run the persistent POSITION strategy with the normal terminal dashboard:
 
 ```bash
 python runner.py --loop
 ```
 
-Read-only local status and performance:
+Run POSITION and enable SCALP for this process in local shadow mode:
 
 ```bash
-python runner.py --shadow-status
-python runner.py --shadow-summary
+python runner.py --loop --scalp-shadow
 ```
 
-Every slow cycle requests a new direct snapshot. Existing snapshots are never
-silently reused after a collection error. Core authentication/account/portfolio
-or scanner failures block analysis. A single candidate history failure is
-recorded as `DATA_UNAVAILABLE` while complete candidates remain analyzable.
-Closed regular markets preserve the existing behavior: no candidate analysis
-and no new shadow entry.
-
-In `SHADOW_TRADING`, a slow-cycle score never opens a position directly. A
-candidate that passes every true-hard data, access, liquidity, structural, and
-risk gate and scores at least `0.60` is saved to
-`state/candidate_watchlist.json`. Signal-quality failures remain explicit
-warnings and do not create a terminal rejection by themselves. The slow score
-is the documented existing coordinator formula:
-
-```text
-0.35 technical + 0.20 news + 0.10 sector + 0.10 market + 0.25 qualitative
-```
-
-The deterministic live score is:
-
-```text
-0.25 spread quality + 0.25 price/VWAP state + 0.15 price/EMA9 state
-+ 0.20 support/resistance location + 0.15 controlled momentum
-```
-
-Raw appreciation is limited to 15% and sharp extensions receive no momentum
-credit. Slow/live weights interpolate linearly from 70%/30% at research time
-to 50%/50% at the 300-second expiration. The dynamic score is their weighted
-sum. A local shadow entry requires a dynamic score of at least `0.72` for two
-consecutive fresh-quote updates, plus every unchanged hard market, spread,
-stop, target, risk/reward, portfolio, daily-loss, sizing, and session rule.
-
-### Candidate gate classification
-
-The executable policy is defined in `agent/gate_policy.py`. Existing numeric
-rules are unchanged.
-
-| Classification | Rules/evidence | Admission effect |
-|---|---|---|
-| `DATA_VALIDITY_HARD` | symbol, required fields, minimum completed candles | terminal for the current slow result; retry on a later factual cycle where applicable |
-| `MARKET_ACCESS_HARD` | configured price/instrument range, regular session, long-only asset policy | no fast-watch admission |
-| `LIQUIDITY_HARD` | quote freshness and maximum spread | no admission; fast quotes recheck transient freshness/spread failures |
-| `STRUCTURAL_TRADE_HARD` | stop reference, stop distance, target above entry | no admission and never overridable by alpha |
-| `RISK_HARD` | minimum risk/reward and portfolio/daily-loss/sizing/duplicate limits | no admission or entry and never overridable by alpha |
-| `SLOW_SIGNAL_QUALITY` | price/VWAP, EMA, RSI, MACD, relative volume, candle structure, market direction, minimum strategy score, maximum conflicts, minimum confidence | contributes to the unchanged slow score and warnings; does not itself terminally reject |
-| `LIVE_SIGNAL_QUALITY` | live spread quality, VWAP/EMA hold, location, controlled momentum | changes live/dynamic alpha; cannot override a hard gate |
-
-`MINIMUM_STRATEGY_SCORE`, `MAXIMUM_CONFLICTS`, and `MINIMUM_CONFIDENCE`
-remain calculated with their original values. They now diagnose slow signal
-quality. The technical score is the sole technical component in the unchanged
-coordinator formula; derived technical confidence is persisted as a diagnostic
-and is not applied as a second numeric penalty or veto.
-
-Score history is sampled every 20 seconds (plus threshold transitions) in the
-bounded `logs/candidate_score_history.jsonl`. Entry-time slow/live/dynamic
-scores, weights, context age, discovery/watchlist/trade-ready/entry timestamps,
-and complete candidate-transition attribution are stored on the local shadow
-position and eventual closed-trade record.
-
-The direct MCP connection is owned by a dedicated asyncio thread for the
-lifetime of `--loop`. Slow collection and the quote provider submit work to the
-same bounded async session. Read-only transient failures use limited exponential
-backoff and a clean reconnect; scanner mutation calls are never automatically
-retried. Ctrl+C closes the MCP session and joins the watcher.
-
-## Fast quote provider
-
-`RobinhoodDirectQuoteProvider` implements the existing `FastQuoteProvider`
-boundary with one direct batched quote request. It measures request latency,
-source quote age, and failure rate. Until at least three real successful samples
-show request latency within the configured two-second interval and source age
-within five seconds, its mode remains `DIRECT_MCP_UNVALIDATED`; the watcher
-therefore behaves conservatively and does not claim `REALTIME_FAST`.
-
-`SnapshotQuoteProvider` remains available only for the opt-in legacy data
-provider. It is not used by the default direct configuration.
-
-## Configuration and data
-
-Important defaults in `config.py`:
-
-| Setting | Default |
-| --- | --- |
-| `MODE` | `SHADOW_TRADING` |
-| `ROBINHOOD_DATA_PROVIDER` | `DIRECT_MCP` |
-| `FAST_QUOTE_PROVIDER` | `DIRECT_MCP` |
-| `SLOW_CYCLE_TARGET_SECONDS` | `300` |
-| `FAST_QUOTE_INTERVAL_SECONDS` | `2` |
-| `CANDIDATE_CONTEXT_TTL_SECONDS` | `300` |
-| `SLOW_WEIGHT_AT_RESEARCH` | `0.70` |
-| `SLOW_WEIGHT_AT_EXPIRATION` | `0.50` |
-| `FAST_ENTRY_CONFIRMATION_UPDATES` | `2` |
-| `SCORE_HISTORY_SAMPLE_SECONDS` | `20` |
-| `ROBINHOOD_MCP_MAX_CONCURRENCY` | `4` |
-| `ROBINHOOD_MCP_READ_RETRIES` | `2` |
-| `MAX_CANDIDATES_TO_ANALYZE` | `10` |
-| `LIVE_TRADING_ENABLED` | `False` |
-| `ROBINHOOD_EXECUTION_ENABLED` | `False` |
-
-Normalized private state and generated logs are gitignored. The snapshot has
-`data_source=ROBINHOOD_MCP`, `mcp_access_path=DIRECT_MCP`, a fresh UTC
-`generated_at`, explicit MCP status, normalized Agentic account/portfolio state,
-scanner information, SPY/QQQ context, candidate data, and warnings/errors. It is
-validated against `schemas/market_snapshot.schema.json` and atomically replaced.
-
-Direct timing telemetry is atomically written to
-`state/direct_mcp_timings.json` and includes connection, scanner, quote,
-historical, candidate collection, indicators, normalization, snapshot total,
-and individual allowlisted tool durations. It never contains tool arguments,
-raw results, account identifiers, or credentials. Reasoning and overall cycle
-durations remain in the existing slow-cycle logs.
-
-## Tests
+Press <kbd>Ctrl</kbd>+<kbd>C</kbd> to stop the loop cleanly. Add `--debug` only
+when you need full per-candidate diagnostics:
 
 ```bash
-python -m pytest -q
+python runner.py --loop --scalp-shadow --debug
 ```
 
-All direct-client tests use mocked SDK/Robinhood behavior. Tests never contact
-Robinhood and never invoke an order tool. Coverage includes OAuth metadata and
-PKCE, secure token persistence, discovery/schema-derived arguments, direct
-snapshot generation, atomic replacement, local indicators, partial candidate
-failure, direct quotes, authentication absence, safety allowlists, lifecycle,
-and clean shutdown.
+The regular U.S. market must be open for new candidates and simulated entries.
+A valid `NO_TRADE` outcome means fresh data was evaluated and no setup passed;
+authentication, provider, or stale-data failures are reported separately.
 
-The deterministic between-bar proof is available without network access:
+## Example session
+
+The following output is **illustrative**. The symbol and values are synthetic;
+they are included to show the dashboard structure, not strategy performance.
+
+```text
+$ python runner.py --loop --scalp-shadow
+TRADER — SHADOW MODE | SHADOW ONLY | LIVE EXECUTION BLOCKED
+
+TRADER — SHADOW MODE
+Time: 2026-09-24T15:02:10+00:00
+Market: OPEN
+Robinhood: CONNECTED — DIRECT_ROBINHOOD_MCP (REALTIME_FAST)
+Safety: SHADOW ONLY — LIVE EXECUTION BLOCKED
+Equity: $10000.00  Cash: $10000.00  Open positions: 0
+Today P&L: realized=$+0.00 unrealized=$+0.00
+
+POSITION
+watching=2 trade-ready=0 open=0 entries=0 exits=0 realized=$+0.00 unrealized=$+0.00
+  top candidates:
+    ACME score=0.681 watch=0.60 trade=0.72 state=SETUP_FORMING
+
+SCALP
+universe=12 fresh=11 classified=4 eligible=1 signal-passes=1 open=0 entries=0 exits=0
+  top candidates:
+    EXAMPLE MICRO_BREAKOUT score=0.731/0.70 state=BLOCKED
+    reason=ENTRY_OVEREXTENDED (price already moved too far to chase)
+  bottleneck: scope=ELIGIBLE_CANDIDATE stage=extension_pass
+```
+
+The repository also includes a deterministic, network-free lifecycle example:
 
 ```bash
 python -c 'from event_driven.simulation import run_deterministic_shadow_simulation as run; print(run())'
 ```
 
-It demonstrates discovery/research, a live-alpha threshold crossing with
-two-update confirmation, risk approval, a local shadow entry before the next
-five-minute scan, a fast target exit, and a separate high-alpha candidate that
-is still blocked by the daily-loss risk veto.
+It uses synthetic data to exercise candidate scoring, confirmation, a local
+shadow entry and exit, and a separate risk rejection. It performs zero real
+order operations.
 
-Official references: [Robinhood Agentic Trading](https://robinhood.com/us/en/support/articles/agentic-trading-overview/),
-[MCP Python SDK OAuth clients](https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/client/oauth-clients.md),
-and [MCP authorization specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization).
+## Demo recordings
+
+### Demo 1: Research scan — recording required
+
+> **Not yet complete.** Record a silent GIF shorter than 20 seconds and save it
+> as `assets/research-scan.gif`. This file does not currently exist. The final
+> GIF should show a fresh research cycle reaching scanner results and a concise
+> candidate decision without exposing account data.
+
+<!-- After recording, replace this comment with:
+![Silent demo of a research scan](assets/research-scan.gif)
+-->
+
+### Demo 2: Simulated trade lifecycle — recording required
+
+> **Not yet complete.** Record a silent GIF shorter than 20 seconds and save it
+> as `assets/shadow-trade.gif`. This file does not currently exist. The final
+> GIF should show a local shadow candidate becoming ready, opening, and closing,
+> with “SHADOW” and “LIVE EXECUTION BLOCKED” visible.
+
+<!-- After recording, replace this comment with:
+![Silent demo of a local shadow trade lifecycle](assets/shadow-trade.gif)
+-->
+
+Do not mark the demo requirement complete until both GIF files have been added
+and their image lines above have been uncommented.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    RH[Robinhood Trading MCP<br/>factual data + project scanner]
+
+    subgraph Slow[Slow research path — about every 5 minutes]
+        Scan[AI_INTRADAY_MOMENTUM_V1<br/>candidate scan]
+        Normalize[Allowlist, normalize, validate<br/>quotes + 5-minute histories]
+        Indicators[Deterministic indicators<br/>EMA / RSI / MACD / VWAP]
+        Reasoning[Event-gated qualitative<br/>Codex reasoning]
+        Coordinator[POSITION coordinator<br/>slow score + hard gates]
+        Context[Local CandidateContext<br/>300-second lifetime]
+        Scan --> Normalize --> Indicators --> Reasoning --> Coordinator --> Context
+    end
+
+    subgraph Fast[Fast quote path — about every 2 seconds]
+        Quotes[Batched direct quotes]
+        LiveScore[POSITION live score<br/>and age-weighted alpha]
+        Scalp[Optional deterministic<br/>SCALP signal engine]
+        Confirm[Setup state +<br/>confirmation checks]
+        Quotes --> LiveScore --> Confirm
+        Quotes --> Scalp --> Confirm
+    end
+
+    subgraph Guard[Deterministic entry checks]
+        Quality[Fresh quote, market,<br/>spread, and data quality]
+        Geometry[Entry, stop, target,<br/>edge, and risk/reward]
+        Risk[Position size, buying power,<br/>daily loss, and duplicate limits]
+        Quality --> Geometry --> Risk
+    end
+
+    subgraph Local[Local shadow execution only]
+        Shadow[ShadowExecutor<br/>simulated fill]
+        Portfolio[(ShadowPortfolio<br/>local JSON / JSONL)]
+        Monitor[FastPositionWatcher<br/>stop / target / time / EOD exits]
+        Shadow --> Portfolio --> Monitor --> Portfolio
+    end
+
+    RH --> Scan
+    RH --> Quotes
+    Context --> LiveScore
+    Confirm --> Quality
+    Risk --> Shadow
+    Risk -. rejection .-> Dashboard[Terminal dashboard<br/>reasons + bottleneck]
+    Portfolio --> Dashboard
+    Shadow -. no broker order .-> Blocked[Real execution blocked]
+```
+
+The slow and fast paths share normalized evidence and local state, but they have
+different responsibilities. Slow research identifies and contextualizes
+candidates. Fast quotes determine whether current conditions still qualify.
+Only deterministic quality, geometry, risk, and portfolio checks can reach the
+local `ShadowExecutor`.
+
+For implementation-level details, see
+[`docs/shadow-runtime-architecture.md`](docs/shadow-runtime-architecture.md) and
+[`docs/direct_robinhood_mcp.md`](docs/direct_robinhood_mcp.md).
+
+## Strategies and decision flow
+
+### POSITION
+
+POSITION is the longer-horizon intraday strategy. A slow cycle analyzes up to
+10 scanner candidates. Candidates that clear true-hard gates and reach the
+`0.60` watch threshold are stored for fast monitoring. The coordinator weights
+currently defined in [`config.py`](config.py) are:
+
+```text
+0.70 technical + 0.10 news + 0.05 sector + 0.05 market + 0.10 qualitative
+```
+
+The fast loop combines that slow score with a deterministic live score based on
+spread quality, VWAP and EMA9 state, support/resistance location, and controlled
+momentum. A local shadow entry requires a combined score of at least `0.72` for
+two consecutive qualifying updates, followed by refreshed geometry, risk, and
+portfolio approval.
+
+### SCALP
+
+SCALP is an independent, deterministic short-horizon strategy. It has no LLM
+dependency and is disabled by default; `--scalp-shadow` enables it only for the
+current loop process. Current gates include a two-second quote-freshness limit,
+0.10% maximum spread, 1.20× minimum completed-bar volume expansion, 0.70 signal
+threshold, 1.10 minimum risk/reward, and 180-second maximum hold. It remains
+local shadow simulation even when enabled.
+
+Candidate appearance never guarantees entry. Both strategies can return no
+trade when data or setup quality is insufficient.
+
+## Safety model
+
+The current repository configuration is deliberately fail-closed:
+
+| Control | Current value | Effect |
+| --- | --- | --- |
+| `MODE` | `SHADOW_TRADING` | Portfolio changes are local simulations. |
+| `LIVE_TRADING_ENABLED` | `False` | Live trading is disabled. |
+| `ROBINHOOD_EXECUTION_ENABLED` | `False` | Robinhood execution is disabled. |
+| Local kill switch | `BLOCKED` | Execution cannot be unblocked by the runtime. |
+| Assets | U.S. equities only | No options, crypto, shorting, margin borrowing, or overnight holds. |
+
+The only permitted Robinhood-side mutation is creation, configuration, and
+execution of the single saved scanner named `AI_INTRADAY_MOMENTUM_V1`. Account,
+position, order, and cash data are otherwise read-only. The project does not
+preview, review, place, modify, cancel, or submit real orders in its current
+mode.
+
+## Configuration and local data
+
+Primary settings live in [`config.py`](config.py). Frequently referenced
+defaults include:
+
+| Setting | Default |
+| --- | ---: |
+| Slow-cycle target | 300 seconds |
+| Fast quote interval | 2 seconds |
+| Candidate context lifetime | 300 seconds |
+| POSITION watch threshold | 0.60 |
+| POSITION entry threshold | 0.72 |
+| POSITION confirmations | 2 updates |
+| SCALP default | Disabled |
+| SCALP signal threshold | 0.70 |
+| SCALP maximum hold | 180 seconds |
+| Shadow starting capital | $10,000 |
+
+Generated runtime state belongs under `state/`; event and diagnostic output
+belongs under `logs/`. Both locations are gitignored because they may contain
+private portfolio context. The normalized market snapshot is validated against
+[`schemas/market_snapshot.schema.json`](schemas/market_snapshot.schema.json)
+before it is atomically replaced.
+
+Never commit generated state, logs, OAuth material, screenshots containing
+account details, or terminal recordings with identifiers.
+
+## Useful commands
+
+| Goal | Command |
+| --- | --- |
+| Run one fresh cycle | `python runner.py --once` |
+| Run POSITION continuously | `python runner.py --loop` |
+| Run POSITION + shadow SCALP | `python runner.py --loop --scalp-shadow` |
+| Show verbose runtime diagnostics | `python runner.py --loop --scalp-shadow --debug` |
+| Show readable strategy status | `python runner.py --strategy-status` |
+| Show watcher and local position state | `python runner.py --shadow-status` |
+| Show local shadow performance summary | `python runner.py --shadow-summary` |
+| Inspect one recent SCALP candidate | `python runner.py --scalp-drilldown SYMBOL` |
+| Show SCALP configuration/state | `python runner.py --scalp-status` |
+| Reset local shadow portfolio state | `python runner.py --reset-shadow` |
+
+`--reset-shadow` asks for an exact interactive confirmation and deletes only
+the local shadow portfolio and trade files. It does not contact Robinhood.
+
+## Testing
+
+Run the complete local test suite with:
+
+```bash
+python -m pytest -q
+```
+
+The tests use temporary portfolios and mocked provider behavior. They cover
+authentication boundaries, snapshot normalization, technical indicators,
+candidate state, quote freshness, strategy gates, risk limits, shadow fills,
+position exits, restart/reconciliation behavior, dashboards, and safety
+invariants. They do not contact Robinhood or place orders.
+
+## FAQ
+
+### Is this a live trading bot?
+
+No. The current runner accepts analysis and shadow-trading modes only. All
+fills and P&L are local simulations, and real execution remains blocked by
+multiple independent controls.
+
+### Why does authorization open a browser?
+
+`python runner.py --robinhood-auth` starts the repository's OAuth/PKCE consent
+flow. Complete that once, then use `--robinhood-mcp-check` to diagnose access.
+Do not copy tokens or browser cookies into configuration files.
+
+### Why do I see `CODEX_NOT_INSTALLED` or unavailable qualitative reasoning?
+
+The POSITION slow-research layer invokes the local Codex CLI with a
+schema-constrained, credential-free payload. Install and authenticate the Codex
+CLI, then retry. The fast quote, risk, and position-management paths do not call
+the LLM.
+
+### Why did the run report no trade?
+
+`NO_TRADE` is normal when fresh data was evaluated and every setup was rejected.
+The dashboard shows the strongest candidates and deepest rejection stage.
+Connection, authentication, missing-data, and stale-data problems are reported
+as errors instead of `NO_TRADE`.
+
+### Why are candidates not evaluated when the market is closed?
+
+The strategies are regular-session, intraday systems. They stop considering new
+entries after the regular U.S. session ends, and overnight positions are not
+allowed.
+
+### Why is SCALP disabled?
+
+`SCALP_ENABLED` defaults to `False`. Use
+`python runner.py --loop --scalp-shadow` to enable it for one shadow process.
+This does not enable real execution or alter the configuration file.
+
+### What does stale quote or stale micro-bar mean?
+
+The provider returned data older than that strategy permits. POSITION and SCALP
+have separate freshness requirements; SCALP is intentionally stricter. The
+runtime blocks the setup rather than inventing or silently reusing current data.
+
+### What does `OVERLAPPING_RUNNER` mean?
+
+Another process owns the local shadow-state lock. Stop the other runner cleanly
+before starting a second one; do not delete the lock while an active process is
+using the portfolio.
+
+### Where are results stored?
+
+Local portfolio, candidate, snapshot, and runtime status files are written under
+`state/`. Append-only events and diagnostics are written under `logs/`. These
+directories are excluded from version control.
+
+### Does the project claim profitable performance?
+
+No. Shadow P&L, backtests, and deterministic simulations are engineering and
+research artifacts. They do not establish future profitability and should not
+be presented as live trading results.
