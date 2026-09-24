@@ -191,30 +191,25 @@ order operations.
 
 ## Demo recordings
 
-### Demo 1: Research scan — recording required
+### Demo 1: Research scan
 
-> **Not yet complete.** Record a silent GIF shorter than 20 seconds and save it
-> as `assets/research-scan.gif`. This file does not currently exist. The final
-> GIF should show a fresh research cycle reaching scanner results and a concise
-> candidate decision without exposing account data.
+This silent, illustrative demo uses synthetic symbols and values. It shows the
+shape of a research cycle without exposing account data or claiming a captured
+live result.
 
-<!-- After recording, replace this comment with:
-![Silent demo of a research scan](assets/research-scan.gif)
--->
+![Silent illustrative demo of a research scan](assets/research-scan.gif)
 
-### Demo 2: Simulated trade lifecycle — recording required
+### Demo 2: Simulated trade lifecycle
 
-> **Not yet complete.** Record a silent GIF shorter than 20 seconds and save it
-> as `assets/shadow-trade.gif`. This file does not currently exist. The final
-> GIF should show a local shadow candidate becoming ready, opening, and closing,
-> with “SHADOW” and “LIVE EXECUTION BLOCKED” visible.
+This silent demo represents the repository's deterministic, network-free
+simulation: confirmation, local shadow entry, target exit, and an independent
+daily-loss rejection. It performs no broker operation.
 
-<!-- After recording, replace this comment with:
 ![Silent demo of a local shadow trade lifecycle](assets/shadow-trade.gif)
--->
 
-Do not mark the demo requirement complete until both GIF files have been added
-and their image lines above have been uncommented.
+Both animations are generated locally by
+[`scripts/generate_readme_gifs.py`](scripts/generate_readme_gifs.py) and are
+shorter than 20 seconds.
 
 ## Architecture
 
