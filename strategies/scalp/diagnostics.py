@@ -290,6 +290,7 @@ def candidate_trace(*, cycle_id, symbol, quality, market_data, detail, now):
         )),
         'setup_detected_anywhere': setup_detected,
         'episode_lifecycle': dict(detail.get('episode_lifecycle', {})),
+        'latency': dict(detail.get('latency', {})),
         'stage_flags': flags,
         'rejection_reasons': list(reasons),
         'blocking_stage': blocking_stage,

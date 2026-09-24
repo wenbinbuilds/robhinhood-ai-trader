@@ -124,11 +124,12 @@ def depth_aware_bottleneck(
 
 def scalp_candidate_projection(trace: Mapping[str, Any]) -> dict[str, Any]:
     flags = trace.get("stage_flags", {})
+    lifecycle = trace.get("episode_lifecycle", {})
     reason = primary_reason(trace.get("blocking_reasons") or trace.get("rejection_reasons"))
     if flags.get("entries"):
         state = "ENTERED"
     elif reason == "STALE_SCALP_EPISODE":
-        state = "EXPIRED"
+        state = lifecycle.get("episode_status") or "DUPLICATE_PROTECTED"
     elif flags.get("signal_score_pass"):
         state = "BLOCKED"
     elif flags.get("eligible_micro_signals"):
@@ -146,6 +147,12 @@ def scalp_candidate_projection(trace: Mapping[str, Any]) -> dict[str, Any]:
         "state": state,
         "reason": reason,
         "reason_text": human_reason(reason),
+        "blocking_stage": trace.get("blocking_stage"),
+        "episode_id": trace.get("episode_id"),
+        "episode_status": lifecycle.get("episode_status"),
+        "close_reason": lifecycle.get("close_reason"),
+        "exact_block_reason": lifecycle.get("exact_block_reason"),
+        "episode_age": lifecycle.get("episode_age_seconds"),
     }
 
 
@@ -153,6 +160,19 @@ def _fmt(value: Any, digits: int = 2, *, signed: bool = False) -> str:
     if not isinstance(value, (int, float)):
         return "UNAVAILABLE"
     return f"{value:+.{digits}f}" if signed else f"{value:.{digits}f}"
+
+
+def _duration(seconds: Any) -> str:
+    if not isinstance(seconds, (int, float)):
+        return "UNAVAILABLE"
+    total = max(0, int(round(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
 
 
 def _today(now: datetime) -> str:
@@ -185,11 +205,12 @@ class RuntimeDashboard:
         watcher_status: str,
         quotes: Mapping[str, Any],
         scalp_result: Mapping[str, Any] | None,
+        scalp_v2_result: Mapping[str, Any] | None = None,
     ) -> bool:
         view = self.project(
             now=now, provider=provider, provider_mode=provider_mode,
             watcher_status=watcher_status, quotes=quotes,
-            scalp_result=scalp_result,
+            scalp_result=scalp_result, scalp_v2_result=scalp_v2_result,
         )
         fingerprint = self.semantic_fingerprint(view)
         if fingerprint == self._fingerprint:
@@ -207,6 +228,7 @@ class RuntimeDashboard:
         watcher_status: str,
         quotes: Mapping[str, Any],
         scalp_result: Mapping[str, Any] | None,
+        scalp_v2_result: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         state = self.portfolio.snapshot()
         day = _today(now)
@@ -248,18 +270,37 @@ class RuntimeDashboard:
 
         diagnostics = dict((scalp_result or {}).get("diagnostics", {}))
         traces = list((scalp_result or {}).get("traces", []))
-        scalp_candidates = sorted(
-            (scalp_candidate_projection(row) for row in traces),
+        projected_scalp = [scalp_candidate_projection(row) for row in traces]
+        stage_index = {name: index for index, name in enumerate(STAGE_NAMES)}
+        eligible_scalp_candidates = sorted(
+            (row for row, trace in zip(projected_scalp, traces)
+             if trace.get("stage_flags", {}).get("eligible_micro_signals")),
+            key=lambda row: (
+                stage_index.get(row.get("blocking_stage"), -1),
+                row["score"] is not None, row["score"] or -1,
+            ),
+            reverse=True,
+        )[:3]
+        filtered_scalp_candidates = sorted(
+            (row for row, trace in zip(projected_scalp, traces)
+             if not trace.get("stage_flags", {}).get("eligible_micro_signals")),
             key=lambda row: (row["score"] is not None, row["score"] or -1),
             reverse=True,
         )[:3]
+        scalp_candidates = eligible_scalp_candidates or filtered_scalp_candidates
         funnel = dict(diagnostics.get("funnel", {}))
         bottleneck = depth_aware_bottleneck(traces, diagnostics)
+        v2 = dict(scalp_v2_result or {})
         market_values = [q.is_market_open for q in quotes.values() if q is not None]
         market = "OPEN" if any(value is True for value in market_values) else (
             "CLOSED" if market_values and all(value is False for value in market_values) else "UNKNOWN"
         )
         connected = watcher_status not in {"FAST_WATCHER_UNAVAILABLE", "NOT_STARTED"}
+        recent_trades = sorted(
+            state.closed_positions,
+            key=lambda row: timestamp(row.exit_timestamp) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )[:5]
         return {
             "now": now.astimezone(timezone.utc).isoformat(),
             "market": market,
@@ -318,8 +359,21 @@ class RuntimeDashboard:
                 "realized": sum(p.net_pnl for p in scalp_closed),
                 "unrealized": sum(p.unrealized_pnl for p in scalp_open),
                 "candidates": scalp_candidates,
+                "eligible_candidates": eligible_scalp_candidates,
+                "filtered_candidates": filtered_scalp_candidates,
                 "bottleneck": bottleneck,
             },
+            "scalp_v2": {
+                "research_only": True,
+                "armed": int(v2.get("armed", 0) or 0),
+                "fast_trigger": int(v2.get("fast_triggers", 0) or 0),
+                "entry_ready": int(v2.get("entry_ready", 0) or 0),
+                "open": int(v2.get("open_research_positions", 0) or 0),
+                "closed": int(v2.get("closed_research_trades", 0) or 0),
+                "realized": float(v2.get("research_realized_pnl", 0) or 0),
+                "unrealized": float(v2.get("research_unrealized_pnl", 0) or 0),
+            },
+            "recent_trades": recent_trades,
         }
 
     @staticmethod
@@ -329,7 +383,10 @@ class RuntimeDashboard:
         def candidate_key(c):
             return (c.get("symbol"), None if c.get("score") is None else round(c["score"], 3),
                     c.get("state"), c.get("reason"))
-        pos, scalp = view["position"], view["scalp"]
+        def trade_key(row):
+            return (row.strategy_display_name, row.symbol, row.exit_timestamp,
+                    row.exit_reason, round(row.net_pnl, 2))
+        pos, scalp, scalp_v2 = view["position"], view["scalp"], view["scalp_v2"]
         return (
             view["market"], view["robinhood"], view["safety"],
             round(view["equity"], 2), round(view["cash"], 2),
@@ -340,13 +397,20 @@ class RuntimeDashboard:
             scalp["universe"], scalp["fresh"], scalp["classified"], scalp["eligible"], scalp["signal_pass"],
             tuple(position_key(p) for p in scalp["open"]),
             tuple(candidate_key(c) for c in scalp["candidates"]),
+            tuple(candidate_key(c) for c in scalp["eligible_candidates"]),
+            tuple(candidate_key(c) for c in scalp["filtered_candidates"]),
             tuple(scalp["bottleneck"].get(k) for k in ("scope", "stage", "reason", "count")),
             scalp["entries_today"], scalp["exits_today"],
+            tuple(scalp_v2.get(key) for key in (
+                "armed", "fast_trigger", "entry_ready", "open", "closed",
+                "realized", "unrealized",
+            )),
+            tuple(trade_key(row) for row in view["recent_trades"]),
         )
 
     @staticmethod
     def render(view: Mapping[str, Any]) -> str:
-        p, s = view["position"], view["scalp"]
+        p, s, v2 = view["position"], view["scalp"], view["scalp_v2"]
         lines = [
             "\nTRADER — SHADOW MODE",
             f"Time: {view['now']}",
@@ -367,11 +431,21 @@ class RuntimeDashboard:
             held = (now - entered).total_seconds() if entered and now else None
             pct = ((row.last_price / row.entry_price - 1) * 100
                    if row.last_price is not None and row.entry_price else None)
+            stop_distance = (
+                row.last_price - row.stop
+                if row.last_price is not None and row.stop is not None else None
+            )
+            target_distance = (
+                row.target - row.last_price
+                if row.last_price is not None and row.target is not None else None
+            )
             lines.append(
                 f"  {row.symbol} OPEN entry=${_fmt(row.entry_price)} current=${_fmt(row.last_price)} "
                 f"stop=${_fmt(row.stop)} target=${_fmt(row.target)} score={_fmt(row.dynamic_score, 3)} "
                 f"pnl=${_fmt(row.unrealized_pnl, signed=True)} ({_fmt(pct, signed=True)}%) "
-                f"hold={_fmt(held, 0)}s status={row.monitoring_status}"
+                f"hold={_duration(held)} distance-to-stop=${_fmt(stop_distance)} "
+                f"distance-to-target=${_fmt(target_distance)} exit=HOLD "
+                f"monitoring={row.monitoring_status}"
             )
         if not p["open"]:
             lines.append("  open positions: NONE")
@@ -397,23 +471,66 @@ class RuntimeDashboard:
             f"eligible={s['eligible']} signal-passes={s['signal_pass']} open={len(s['open'])} "
             f"entries={s['entries_today']} exits={s['exits_today']} "
             f"realized=${_fmt(s['realized'], signed=True)} unrealized=${_fmt(s['unrealized'], signed=True)}",
-            "  top candidates:",
+            "  ELIGIBLE / DEEPEST CANDIDATES:",
         ])
-        for row in s["candidates"]:
+        for row in s["eligible_candidates"]:
             lines.append(
                 f"    {row['symbol']} {row['setup']} score={_fmt(row['score'], 3)}/"
                 f"{row['threshold']:.2f} quote-age={_fmt(row['quote_age'], 1)}s "
                 f"spread={_fmt((row['spread'] * 100) if row['spread'] is not None else None, 3)}% "
                 f"volume={_fmt(row['volume_expansion'], 2)}x state={row['state']} "
+                f"block={row['reason']} ({row['reason_text']})"
+            )
+            if row.get('episode_id'):
+                lines.append(
+                    f"      episode={row['episode_id']} status={row.get('episode_status') or row['state']} "
+                    f"close={row.get('close_reason') or 'NONE'} "
+                    f"block-detail={row.get('exact_block_reason') or row['reason']}"
+                )
+        if not s["eligible_candidates"]:
+            lines.append("    NONE")
+        lines.append("  TOP FILTERED CANDIDATES:")
+        for row in s["filtered_candidates"]:
+            lines.append(
+                f"    {row['symbol']} {row['setup']} score={_fmt(row['score'], 3)}/"
+                f"{row['threshold']:.2f} quote-age={_fmt(row['quote_age'], 1)}s "
+                f"volume={_fmt(row['volume_expansion'], 2)}x "
                 f"reason={row['reason']} ({row['reason_text']})"
             )
-        if not s["candidates"]:
+        if not s["filtered_candidates"]:
             lines.append("    NONE")
         b = s["bottleneck"]
         lines.append(
             f"  bottleneck: scope={b['scope']} stage={b['stage']} "
             f"reason={b['reason']} count={b['count']} — {b['message']}"
         )
+        lines.extend([
+            "",
+            "SCALP V1 vs V2 — RESEARCH ONLY",
+            f"  V1 eligible={s['eligible']} signal-pass={s['signal_pass']} "
+            f"entry={s['entries_today']}",
+            f"  V2 armed={v2['armed']} fast-trigger={v2['fast_trigger']} "
+            f"entry-ready={v2['entry_ready']} open-research={v2['open']} "
+            f"closed-research={v2['closed']}",
+            f"  V1 canonical realized=${_fmt(s['realized'], signed=True)} "
+            f"V2 research realized=${_fmt(v2['realized'], signed=True)} "
+            f"unrealized=${_fmt(v2['unrealized'], signed=True)}",
+        ])
+        lines.extend(["", "RECENT TRADES"])
+        for trade in view["recent_trades"]:
+            held = getattr(trade, 'holding_time_seconds', 0) or (
+                getattr(trade, 'holding_time_minutes', 0) * 60
+            )
+            cost = trade.gross_pnl - trade.net_pnl
+            lines.append(
+                f"  {trade.strategy_display_name} {trade.symbol} "
+                f"${_fmt(trade.entry_price)} → ${_fmt(trade.exit_price)} "
+                f"hold={_duration(held)} exit={trade.exit_reason} "
+                f"gross=${_fmt(trade.gross_pnl, signed=True)} "
+                f"cost=${_fmt(cost)} net=${_fmt(trade.net_pnl, signed=True)}"
+            )
+        if not view["recent_trades"]:
+            lines.append("  NONE")
         return "\n".join(lines)
 
 
@@ -429,6 +546,14 @@ def render_scalp_drilldown(trace: Mapping[str, Any]) -> str:
         f"quote_status={f.get('quote_status')} quote_age={f.get('quote_age_seconds')} spread={trace.get('spread', {}).get('observed_pct')}",
         f"completed_bar={micro.get('latest_completed_bar_timestamp')} bar_age={micro.get('bar_age_seconds')} provider={micro.get('provider_status')}",
         f"episode_created={life.get('episode_created_at')} episode_age={life.get('episode_age_seconds')} status={life.get('episode_status')}",
+        f"episode_closed={life.get('episode_closed_at')} close_reason={life.get('close_reason')} exact_block={life.get('exact_block_reason')}",
+        f"fingerprint_current={life.get('current_structural_fingerprint')}",
+        f"fingerprint_original={life.get('initial_structural_fingerprint')}",
+        f"fingerprint_fields={life.get('fingerprint_fields')}",
+        f"structure_changed={life.get('structure_changed')} new_episode_allowed={life.get('new_episode_allowed')}",
+        f"quote_price={life.get('current_quote_price')} anchor_original={life.get('original_anchor_price')}",
+        f"bar_current={life.get('current_short_bar_timestamp')} bar_original={life.get('original_bar_timestamp')}",
+        f"volume_current={life.get('current_volume_expansion')} volume_original={life.get('original_volume_expansion')}",
         f"score_before_penalties={s.get('score_before_penalties')} penalties={s.get('total_penalties')} final_score={s.get('score')} threshold={s.get('minimum')}",
     ]
     for name, row in s.get("components", {}).items():

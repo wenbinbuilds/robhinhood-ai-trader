@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from time import perf_counter_ns
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
@@ -295,14 +296,24 @@ class ShadowExecutionEngine:
             scalp_exit_status=('MONITORING' if is_scalp else None),
             scalp_next_required_action=('MONITOR_POSITION' if is_scalp else None),
         )
+        shadow_started = perf_counter_ns()
+        shadow_requested_at = datetime.now(timezone.utc).isoformat()
         self.portfolio.add_position(position)
+        shadow_created_at = datetime.now(timezone.utc).isoformat()
         return position, {"symbol": symbol, "status": "OPENED",
                           "risk": result.to_dict(),
                           'pre_execution_passed': True,
                           'portfolio_attempted': True,
                           'portfolio_approved': True,
                           'safety_approved': True,
-                          'fill_risk_reward_ratio': risk_reward}
+                          'fill_risk_reward_ratio': risk_reward,
+                          'execution_latency': {
+                              'shadow_entry_requested_at': shadow_requested_at,
+                              'shadow_position_created_at': shadow_created_at,
+                              'shadow_execution_duration_ms': (
+                                  perf_counter_ns() - shadow_started
+                              ) / 1_000_000,
+                          }}
 
     def monitor_positions(
         self,

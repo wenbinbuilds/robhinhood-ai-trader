@@ -207,6 +207,12 @@ class ShadowPortfolio:
             mark = marks.get(position.symbol, position.last_price or position.entry_price)
             position.last_price = float(mark)
             position.unrealized_pnl = round((float(mark) - position.entry_price) * position.quantity, 4)
+            position.maximum_favorable_excursion = max(
+                position.maximum_favorable_excursion, position.unrealized_pnl,
+            )
+            position.maximum_adverse_excursion = min(
+                position.maximum_adverse_excursion, position.unrealized_pnl,
+            )
             unrealized += position.unrealized_pnl
             market_value += float(mark) * position.quantity
         self.state.unrealized_pnl = round(unrealized, 4)

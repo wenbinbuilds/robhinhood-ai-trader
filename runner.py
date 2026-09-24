@@ -100,6 +100,19 @@ def load_scalp_runtime(portfolio, context_store, snapshot_path, *, enabled=None,
         debug=debug, history_refresher=history_refresher)
 
 
+def load_scalp_v2_runtime(*, scalp_enabled: bool):
+    """Load isolated V2 research only when the V1 shadow stream is running."""
+    if not scalp_enabled or not config.SCALP_V2_RESEARCH_ENABLED:
+        return None
+    if config.MODE != "SHADOW_TRADING" or config.SCALP_MODE != "SHADOW":
+        raise RuntimeError("HYBRID_SCALP research is SHADOW_TRADING only")
+    from strategies.scalp_v2 import HybridScalpResearchEngine
+    return HybridScalpResearchEngine(
+        state_path=PROJECT_DIR / config.SCALP_V2_STATE_PATH,
+        events_path=PROJECT_DIR / config.SCALP_V2_EVENT_LOG_PATH,
+    )
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run local Robinhood research or shadow simulation without orders."
@@ -1183,6 +1196,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                                     enabled=scalp_enabled, debug=debug_runtime,
                                     direct_client=client,
                                 ),
+                                scalp_v2_runtime=load_scalp_v2_runtime(
+                                    scalp_enabled=scalp_enabled,
+                                ),
                                 debug=debug_runtime,
                                 dashboard=(None if debug_runtime else RuntimeDashboard(
                                     portfolio, context_store,
@@ -1236,6 +1252,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     scalp_runtime=load_scalp_runtime(
                         portfolio, context_store, snapshot,
                         enabled=scalp_enabled, debug=debug_runtime,
+                    ),
+                    scalp_v2_runtime=load_scalp_v2_runtime(
+                        scalp_enabled=scalp_enabled,
                     ),
                     debug=debug_runtime,
                     dashboard=(None if debug_runtime else RuntimeDashboard(

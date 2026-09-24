@@ -161,8 +161,9 @@ def test_stale_episode_lifecycle_and_structural_reset_creates_new_identity(tmp_p
         'ACME', 'MICRO_BREAKOUT', ('break',), NOW.isoformat(), old,
         now=NOW+timedelta(seconds=10),
     )
-    assert stale.state == 'CLOSED'
-    assert stale.stale_reason == 'EPISODE_ID_PREVIOUSLY_CLOSED'
+    assert stale.state == 'RESOLVED'
+    assert stale.stale_reason == 'SAME_STRUCTURE_AS_RESOLVED_EPISODE'
+    assert stale.close_reason == 'TRADE_COMPLETED'
     assert stale.stale_after_seconds is None
     reset = SimpleNamespace(recent_high=102.0, recent_low=100.0)
     new = controller.episode(

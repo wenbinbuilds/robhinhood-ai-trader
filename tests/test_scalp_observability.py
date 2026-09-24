@@ -173,6 +173,22 @@ def test_same_episode_cannot_double_count_an_entry_in_runtime(tmp_path, monkeypa
     assert second['diagnostics']['funnel']['duplicate_exposure_blocked'] == 1
     assert sum(result['diagnostics']['funnel']['entries']
                for result in (first, second)) == 1
+    latency = first['traces'][0]['latency']
+    assert latency['exchange_timestamp'] is not None
+    assert latency['feature_compute_duration_ms'] >= 0
+    assert latency['setup_compute_duration_ms'] >= 0
+    assert latency['geometry_compute_duration_ms'] >= 0
+    assert latency['risk_duration_ms'] >= 0
+    assert latency['preexecution_duration_ms'] >= 0
+    assert latency['shadow_entry_requested_at'] is not None
+    assert latency['shadow_position_created_at'] is not None
+    assert latency['shadow_execution_duration_ms'] >= 0
+    persisted = json.loads((tmp_path/'s.json').read_text())
+    milestones = persisted['active_episodes'][0]['latency_milestones']
+    assert milestones['first_eligible_at']
+    assert milestones['first_score_070_at']
+    assert milestones['first_edge_pass_at']
+    assert milestones['first_rr_pass_at']
 
 
 def test_rejection_reason_classification_and_detail_payloads():

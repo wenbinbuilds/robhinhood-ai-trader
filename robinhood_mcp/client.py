@@ -630,7 +630,23 @@ class DirectRobinhoodMcpClient:
 
         async def collect() -> list[ToolCall | BaseException]:
             tool = self.require_tool("get_equity_historicals")
-            tasks = [self._call_with_retry(tool.name, historical_arguments(tool, symbol)) for symbol in normalized]
+            # Do not let a long universe history batch fill the global MCP
+            # semaphore. Quotes use the remaining capacity and can interleave
+            # instead of waiting behind every queued historical request.
+            limiter = asyncio.Semaphore(
+                max(1, min(
+                    config.ROBINHOOD_MCP_HISTORICAL_BATCH_CONCURRENCY,
+                    config.ROBINHOOD_MCP_MAX_CONCURRENCY - 1,
+                ))
+            )
+
+            async def historical(symbol):
+                async with limiter:
+                    return await self._call_with_retry(
+                        tool.name, historical_arguments(tool, symbol)
+                    )
+
+            tasks = [historical(symbol) for symbol in normalized]
             return list(await asyncio.gather(*tasks, return_exceptions=True))
 
         return self._submit(collect())

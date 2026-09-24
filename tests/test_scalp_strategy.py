@@ -263,27 +263,179 @@ def test_same_evidence_episode_is_closed_and_new_bar_creates_new_episode(tmp_pat
     first = setup.episode('ACME', kind, evidence, bars[-1]['begins_at'], features, now=NOW)
     setup.close(first.episode_id, 'ACME')
     stale = setup.episode('ACME', kind, evidence, bars[-1]['begins_at'], features, now=NOW)
-    assert stale.state == 'CLOSED' and stale.episode_id == first.episode_id
+    assert stale.state == 'RESOLVED' and stale.episode_id == first.episode_id
+    assert stale.new_episode_allowed is False
     later = NOW+timedelta(minutes=1)
     newer_data = market_data(later)
+    newer_data['candles'][-1]['high'] = 101.0
+    newer_data['candles'][-1]['close'] = 100.8
     newer_features = signal.features('ACME', quote(later), newer_data, now=later)
     newer_bars = completed_micro_bars(newer_data['candles'], later)
     second = setup.episode('ACME', kind, evidence, newer_bars[-1]['begins_at'], newer_features, now=later)
     assert second.episode_id != first.episode_id
 
 
-def test_superseded_episode_cannot_return(tmp_path):
+def test_invalidated_structure_can_form_a_new_generation_after_reset(tmp_path):
     setup = ScalpSetupController(tmp_path/'setups.json')
     signal = ScalpSignalEngine()
     first_data = market_data(); first_features = signal.features('ACME', quote(), first_data, now=NOW)
     first_bars = completed_micro_bars(first_data['candles'], NOW)
     first = setup.episode('ACME', 'MICRO_BREAKOUT', ('a',), first_bars[-1]['begins_at'], first_features, now=NOW)
     later = NOW+timedelta(minutes=1); second_data = market_data(later)
+    second_data['candles'][-1]['high'] = 101.0
+    second_data['candles'][-1]['close'] = 100.8
     second_features = signal.features('ACME', quote(later), second_data, now=later)
     second_bars = completed_micro_bars(second_data['candles'], later)
-    setup.episode('ACME', 'MICRO_BREAKOUT', ('b',), second_bars[-1]['begins_at'], second_features, now=later)
-    assert setup.episode('ACME', 'MICRO_BREAKOUT', ('a',), first_bars[-1]['begins_at'],
-                         first_features, now=later).state == 'CLOSED'
+    second = setup.episode('ACME', 'MICRO_BREAKOUT', ('b',), second_bars[-1]['begins_at'], second_features, now=later)
+    returned = setup.episode('ACME', 'MICRO_BREAKOUT', ('a',), first_bars[-1]['begins_at'],
+                             first_features, now=later)
+    assert returned.state == 'FORMING'
+    assert returned.episode_id not in {first.episode_id, second.episode_id}
+    assert setup.closed_details[first.episode_id]['state'] == 'INVALIDATED'
+
+
+@pytest.mark.parametrize('setup_type,anchor_type', [
+    ('MICRO_BREAKOUT', 'PRIOR_COMPLETED_MICRO_HIGH'),
+    ('MICRO_PULLBACK', 'EMA9_INTERACTION'),
+    ('EMA9_CONTINUATION', 'EMA9_TREND'),
+    ('VWAP_RECLAIM', 'VWAP_CROSS'),
+    ('MOMENTUM_BURST', 'LATEST_COMPLETED_CLOSE'),
+])
+def test_setup_specific_fingerprint_fields_are_explicit(
+    tmp_path, setup_type, anchor_type,
+):
+    signal = ScalpSignalEngine()
+    features = signal.features('ACME', quote(), market_data(), now=NOW)
+    controller = ScalpSetupController(tmp_path/f'{setup_type}.json')
+    fields = controller.fingerprint_fields(setup_type, NOW.isoformat(), features)
+    assert fields['setup_type'] == setup_type
+    assert fields['anchor_type'] == anchor_type
+    assert fields['completed_bar_timestamp'] == NOW.isoformat()
+    assert set(fields) >= {
+        'anchor_price', 'ema9', 'ema20', 'vwap', 'local_high', 'local_low',
+        'volume_state', 'volume_expansion',
+    }
+
+
+def test_ema_and_vwap_changes_no_longer_collide_in_fingerprint(tmp_path):
+    controller = ScalpSetupController(tmp_path/'setups.json')
+    first = SimpleNamespace(
+        recent_high=101.0, recent_low=99.0, ema9=100.0, ema20=99.8,
+        vwap=99.9, volume_expansion=1.4, price=100.2,
+        return_1=.002, volume_acceleration=.1,
+    )
+    changed = SimpleNamespace(**{
+        **first.__dict__, 'ema9': 100.1, 'vwap': 100.0,
+    })
+    one = controller.evidence_key(
+        'ACME', 'EMA9_CONTINUATION', NOW.isoformat(), first,
+    )
+    two = controller.evidence_key(
+        'ACME', 'EMA9_CONTINUATION', NOW.isoformat(), changed,
+    )
+    assert one != two
+
+
+def test_soft_failure_does_not_close_forming_episode(tmp_path):
+    controller = ScalpSetupController(tmp_path/'setups.json')
+    features = SimpleNamespace(
+        recent_high=101.0, recent_low=99.0, ema9=100.0, ema20=99.8,
+        vwap=99.9, volume_expansion=1.4, price=100.2,
+        return_1=.002, volume_acceleration=.1,
+    )
+    first = controller.episode(
+        'ACME', 'EMA9_CONTINUATION', ('trend',), NOW.isoformat(),
+        features, now=NOW,
+    )
+    # A score rejection is deliberately not a state transition in the setup
+    # controller. The next observation must see the same FORMING episode.
+    second = controller.episode(
+        'ACME', 'EMA9_CONTINUATION', ('trend',), NOW.isoformat(),
+        features, now=NOW+timedelta(seconds=10),
+    )
+    assert first.episode_id == second.episode_id
+    assert second.state == 'FORMING'
+    assert first.episode_id not in controller.closed
+
+
+def test_unchanged_episode_does_not_rewrite_full_state_each_quote(tmp_path):
+    controller = ScalpSetupController(tmp_path/'setups.json')
+    features = SimpleNamespace(
+        recent_high=101.0, recent_low=99.0, ema9=100.0, ema20=99.8,
+        vwap=99.9, volume_expansion=1.4, price=100.2,
+        return_1=.002, volume_acceleration=.1,
+    )
+    writes = 0
+    original_save = controller.save
+
+    def counted_save():
+        nonlocal writes
+        writes += 1
+        return original_save()
+
+    controller.save = counted_save
+    first = controller.episode(
+        'ACME', 'EMA9_CONTINUATION', ('trend',), NOW.isoformat(),
+        features, now=NOW,
+    )
+    controller.episode(
+        'ACME', 'EMA9_CONTINUATION', ('trend',), NOW.isoformat(),
+        features, now=NOW+timedelta(seconds=2),
+    )
+    assert writes == 1
+    controller.record_latency_milestones(
+        first.episode_id, 'ACME', {'first_eligible_at': NOW.isoformat()},
+    )
+    controller.record_latency_milestones(
+        first.episode_id, 'ACME', {'first_eligible_at': NOW.isoformat()},
+    )
+    assert writes == 2
+
+
+def test_completed_trade_is_protected_until_setup_specific_reset(tmp_path):
+    controller = ScalpSetupController(tmp_path/'setups.json')
+    breakout = SimpleNamespace(
+        recent_high=101.0, recent_low=99.0, ema9=100.0, ema20=99.8,
+        vwap=99.9, volume_expansion=1.4, price=101.2,
+        return_1=.002, volume_acceleration=.1,
+    )
+    first = controller.episode(
+        'ACME', 'MICRO_BREAKOUT', ('break',), NOW.isoformat(),
+        breakout, now=NOW,
+    )
+    controller.transition(
+        first.episode_id, 'ACME', 'READY', now=NOW, reason='SIGNAL_READY',
+    )
+    controller.transition(
+        first.episode_id, 'ACME', 'ENTERED', now=NOW, reason='SHADOW_ENTRY',
+    )
+    controller.close(
+        first.episode_id, 'ACME', now=NOW+timedelta(seconds=30),
+        reason='TRADE_COMPLETED:TARGET_HIT',
+    )
+    duplicate = controller.episode(
+        'ACME', 'MICRO_BREAKOUT', ('break',), NOW.isoformat(),
+        breakout, now=NOW+timedelta(seconds=31),
+    )
+    assert duplicate.state == 'RESOLVED'
+    assert duplicate.new_episode_allowed is False
+
+    reset = SimpleNamespace(**{**breakout.__dict__, 'price': 100.9})
+    reset_episode = controller.episode(
+        'ACME', 'UNCLASSIFIED', (), NOW.isoformat(), reset,
+        now=NOW+timedelta(seconds=40),
+    )
+    assert reset_episode.state == 'FORMING'
+    new_breakout = SimpleNamespace(**{
+        **breakout.__dict__, 'recent_high': 102.0, 'price': 102.2,
+    })
+    new_episode = controller.episode(
+        'ACME', 'MICRO_BREAKOUT', ('new_break',),
+        (NOW+timedelta(minutes=5)).isoformat(), new_breakout,
+        now=NOW+timedelta(minutes=5),
+    )
+    assert new_episode.state == 'FORMING'
+    assert new_episode.episode_id != first.episode_id
 
 
 def test_overtrading_and_daily_loss_guards(tmp_path, monkeypatch):

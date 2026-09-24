@@ -214,7 +214,10 @@ class ScalpPositionController:
                 )
             if trade is None:
                 continue
-            self.setup_controller.close(trade.episode_id, trade.symbol)
+            self.setup_controller.close(
+                trade.episode_id, trade.symbol, now=now,
+                reason=f'TRADE_COMPLETED:{trade.exit_reason}',
+            )
             event = {
                 'STOP_HIT': 'ScalpStopHit', 'TARGET_HIT': 'ScalpTargetHit',
                 'SCALP_TIME_EXIT': 'ScalpTimeExit',

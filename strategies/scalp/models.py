@@ -72,6 +72,21 @@ class ScalpEpisode:
     new_episode_allowed: bool = True
     stale_after_seconds: float | None = None
     stale_reason: str | None = None
+    closed_at: str | None = None
+    close_reason: str | None = None
+    fingerprint_fields: dict[str, Any] = field(default_factory=dict)
+    original_fingerprint_fields: dict[str, Any] = field(default_factory=dict)
+    current_quote_price: float | None = None
+    original_anchor_price: float | None = None
+    current_bar_timestamp: str | None = None
+    original_bar_timestamp: str | None = None
+    current_volume_expansion: float | None = None
+    original_volume_expansion: float | None = None
+    exact_block_reason: str | None = None
+    transition_history: tuple[dict[str, Any], ...] = ()
+    # First-observed wall-clock milestones survive restarts. Per-observation
+    # monotonic phase durations live in the diagnostics journal instead.
+    latency_milestones: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

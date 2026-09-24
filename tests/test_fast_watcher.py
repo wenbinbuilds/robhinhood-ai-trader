@@ -557,6 +557,22 @@ def test_event_sampling_and_rotation(tmp_path, monkeypatch):
     assert len(list(tmp_path.glob("events.jsonl*"))) == 2
 
 
+def test_cycle_timing_is_persisted_separately_from_strategy_events(tmp_path):
+    watcher, *_ = setup_watcher(tmp_path)
+    watcher.tick()
+    rows = [json.loads(line) for line in
+            (tmp_path/'fast_watcher_latency.jsonl').read_text().splitlines()]
+    timing = rows[-1]
+    assert timing['event'] == 'FAST_CYCLE_TIMING'
+    assert timing['quote_batch_duration_seconds'] >= 0
+    assert timing['position_work_duration_seconds'] >= 0
+    assert timing['scalp_work_duration_seconds'] >= 0
+    assert timing['terminal_render_duration_seconds'] >= 0
+    assert timing['status_persistence_duration_seconds'] >= 0
+    assert timing['cycle_duration_seconds'] >= 0
+    assert timing['estimated_wait_seconds'] >= 0
+
+
 def test_watcher_source_has_no_llm_codex_or_broker_client():
     root = Path(__file__).resolve().parents[1] / "watcher"
     imports = []

@@ -79,6 +79,15 @@ def test_existing_trade_history_is_preserved_on_initialization(tmp_path: Path) -
     assert trades_path.read_text(encoding="utf-8") == existing
 
 
+def test_revalue_tracks_position_mfe_and_mae(tmp_path: Path) -> None:
+    portfolio, _, position = opened(tmp_path)
+    portfolio.revalue({'ACME': position.entry_price + 1.0})
+    portfolio.revalue({'ACME': position.entry_price - .5})
+    restored = portfolio.snapshot().open_positions[0]
+    assert restored.maximum_favorable_excursion == pytest.approx(position.quantity)
+    assert restored.maximum_adverse_excursion == pytest.approx(-.5 * position.quantity)
+
+
 def test_benchmark_not_initialized_while_market_closed(tmp_path: Path) -> None:
     portfolio = ShadowPortfolio(tmp_path / "p.json", tmp_path / "t.jsonl")
     portfolio.begin_cycle(

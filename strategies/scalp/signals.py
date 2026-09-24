@@ -304,9 +304,11 @@ class ScalpSignalEngine:
         return audit
 
     def evaluate(self, episode_id: str, symbol: str, quote: FastQuote | None,
-                 data: Mapping[str, Any], *, now: datetime):
-        bars = completed_micro_bars(data.get('candles', []) or [], now)
-        f = self.features(symbol, quote, data, now=now)
+                 data: Mapping[str, Any], *, now: datetime,
+                 features: ScalpFeatures | None = None, bars=None):
+        bars = (completed_micro_bars(data.get('candles', []) or [], now)
+                if bars is None else list(bars))
+        f = features or self.features(symbol, quote, data, now=now)
         score_breakdown, score = self.score(f)
         f = replace(f, score_breakdown=score_breakdown)
         setup, evidence = self.classify(f, bars)

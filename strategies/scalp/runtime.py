@@ -1,6 +1,8 @@
 """Wires entry and position controllers without any LLM dependency."""
 from datetime import datetime, timezone
 from pathlib import Path
+from inspect import signature
+from time import perf_counter_ns
 from uuid import uuid4
 from collections import defaultdict
 
@@ -33,6 +35,7 @@ class ScalpRuntime:
         self.entry = ScalpEntryController(
             portfolio, setup_path=setup_path, events_path=events_path,
             enabled=enabled, kill_switch_path=kill_switch_path,
+            clock=self.clock,
         )
         self.positions = ScalpPositionController(
             portfolio, setup_controller=self.entry.setup_controller,
@@ -43,19 +46,33 @@ class ScalpRuntime:
 
     def on_quotes(self, quotes, *, now, entry_quotes=None, quote_quality=None,
                   loop_timing=None, position_quotes=None):
+        runtime_started = perf_counter_ns()
+        runtime_timing = dict(loop_timing or {})
+        runtime_timing['scalp_cycle_start'] = self.clock().astimezone(
+            timezone.utc
+        ).isoformat()
+        observed_started = perf_counter_ns()
         observed = quotes if entry_quotes is None else entry_quotes
         self._observe_quotes(observed, now)
+        runtime_timing['quote_tape_update_duration_ms'] = (
+            perf_counter_ns() - observed_started
+        ) / 1_000_000
         # Position exits run first. A just-closed episode is permanently closed;
         # entry then needs a genuinely different evidence key.
+        position_started = perf_counter_ns()
         exits = self.positions.process_quotes(
             quotes if position_quotes is None else position_quotes,
             self._data, now=now,
         )
+        runtime_timing['scalp_position_work_duration_ms'] = (
+            perf_counter_ns() - position_started
+        ) / 1_000_000
         lifecycle = list(getattr(self.positions, 'last_lifecycle', []))
         universe = self.symbols(now)
         refresh = None
         effective_now = now
         if self.history_refresher is not None:
+            refresh_started = perf_counter_ns()
             refresh = self.history_refresher.poll(
                 universe, now=now,
                 quote_timestamps={
@@ -63,11 +80,20 @@ class ScalpRuntime:
                     if quote is not None
                 },
             )
+            runtime_timing['history_scheduler_duration_ms'] = (
+                perf_counter_ns() - refresh_started
+            ) / 1_000_000
+            snapshot_started = perf_counter_ns()
             data_by_symbol = self.history_refresher.get_many(universe)
+            runtime_timing['history_snapshot_duration_ms'] = (
+                perf_counter_ns() - snapshot_started
+            ) / 1_000_000
             cycle_lookup = lambda symbol: self._with_quote_microstructure(
                 symbol, data_by_symbol.get(symbol.upper(), {}), now
             )
         else:
+            runtime_timing['history_scheduler_duration_ms'] = 0.0
+            runtime_timing['history_snapshot_duration_ms'] = 0.0
             cycle_lookup = lambda symbol: self._with_quote_microstructure(
                 symbol, self._data(symbol), now
             )
@@ -85,7 +111,14 @@ class ScalpRuntime:
                 'reasons': ['OVERDUE_EXIT_PENDING'], 'entry_attempted': False,
             } for symbol in universe]
         else:
-            entries = self.entry.on_quotes(observed, cycle_lookup, now=effective_now)
+            entry_started = perf_counter_ns()
+            entry_kwargs = {'now': effective_now}
+            if 'cycle_timing' in signature(self.entry.on_quotes).parameters:
+                entry_kwargs['cycle_timing'] = runtime_timing
+            entries = self.entry.on_quotes(observed, cycle_lookup, **entry_kwargs)
+            runtime_timing['entry_evaluation_duration_ms'] = (
+                perf_counter_ns() - entry_started
+            ) / 1_000_000
         qualities = quote_quality or {}
         detail_by_symbol = {detail.get('symbol'): detail for detail in entries}
         cycle_id = 'SCALP-CYCLE-' + uuid4().hex
@@ -124,9 +157,21 @@ class ScalpRuntime:
         diagnostics = cycle_diagnostics(
             cycle_id=cycle_id, traces=traces, source=self.discovery_source,
             now=effective_now, exits=len(exits), refresh=refresh,
-            loop_timing=loop_timing, position_lifecycle=lifecycle,
+            loop_timing=runtime_timing, position_lifecycle=lifecycle,
         )
+        runtime_timing['scalp_runtime_prejournal_duration_ms'] = (
+            perf_counter_ns() - runtime_started
+        ) / 1_000_000
+        diagnostics['fast_watcher_timing'].update(runtime_timing)
+        journal_started = perf_counter_ns()
         self.diagnostics.record(diagnostics, traces)
+        runtime_timing['diagnostic_journal_duration_ms'] = (
+            perf_counter_ns() - journal_started
+        ) / 1_000_000
+        runtime_timing['scalp_runtime_total_duration_ms'] = (
+            perf_counter_ns() - runtime_started
+        ) / 1_000_000
+        diagnostics['fast_watcher_timing'].update(runtime_timing)
         if self.debug:
             for trace in traces:
                 if trace['stage_flags'].get('eligible_micro_signals'):

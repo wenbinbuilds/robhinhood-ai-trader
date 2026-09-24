@@ -34,11 +34,11 @@ def candidate(reason, stage, score, *, eligible=True):
     }
 
 
-def fake_portfolio(open_positions=()):
+def fake_portfolio(open_positions=(), closed_positions=()):
     state = SimpleNamespace(
         equity=10005.0, cash=9000.0, realized_pnl=3.0,
         unrealized_pnl=2.0, open_positions=list(open_positions),
-        closed_positions=[],
+        closed_positions=list(closed_positions),
     )
     return SimpleNamespace(snapshot=lambda: state)
 
@@ -93,6 +93,61 @@ def test_normal_dashboard_renders_position_and_scalp_candidate(monkeypatch):
     assert "PRGO OPEN" in output and "score=0.722" in output
     assert "NBIS MICRO_BREAKOUT score=0.749/0.70" in output
     assert "bottleneck: scope=ELIGIBLE_CANDIDATE" in output
+
+
+def test_dashboard_lists_deep_eligible_candidates_before_early_filters(monkeypatch):
+    import trading_runtime.observability as module
+    monkeypatch.setattr(module, "read_kill_switch", lambda _: SimpleNamespace(trading_blocked=True))
+    deep = candidate("STALE_SCALP_EPISODE", "episode_open_pass", None)
+    deep["symbol"] = "META"
+    deep["episode_id"] = "SCALP-META-1"
+    deep["episode_lifecycle"] = {
+        "episode_status": "RESOLVED",
+        "close_reason": "TRADE_COMPLETED:TARGET_HIT",
+        "exact_block_reason": "SAME_STRUCTURE_AS_RESOLVED_EPISODE",
+    }
+    early = candidate(
+        "VOLUME_EXPANSION_BELOW_MINIMUM", "volume_expansion_pass", .95,
+        eligible=False,
+    )
+    early["symbol"] = "NVDA"
+    dashboard = RuntimeDashboard(fake_portfolio())
+    view = dashboard.project(
+        now=NOW, provider="DIRECT", provider_mode="REALTIME_FAST",
+        watcher_status="ACTIVE", quotes={},
+        scalp_result={"traces": [early, deep], "diagnostics": {"funnel": {
+            "eligible_micro_signals": 1,
+        }}},
+    )
+    output = dashboard.render(view)
+    assert view["scalp"]["eligible_candidates"][0]["symbol"] == "META"
+    assert view["scalp"]["filtered_candidates"][0]["symbol"] == "NVDA"
+    assert output.index("META MICRO_BREAKOUT") < output.index("TOP FILTERED CANDIDATES")
+    assert "block=STALE_SCALP_EPISODE" in output
+
+
+def test_dashboard_renders_recent_trade_cost_and_hold(monkeypatch):
+    import trading_runtime.observability as module
+    monkeypatch.setattr(module, "read_kill_switch", lambda _: SimpleNamespace(trading_blocked=True))
+    trade = SimpleNamespace(
+        strategy="MOMENTUM", strategy_id="MOMENTUM",
+        strategy_display_name="POSITION", symbol="PRGO",
+        entry_timestamp="2026-09-24T16:00:00+00:00", entry_price=14.90,
+        exit_timestamp="2026-09-24T16:04:12+00:00", exit_price=14.88,
+        exit_reason="STOP_HIT", gross_pnl=-.12, net_pnl=-.20,
+        holding_time_seconds=252.0, holding_time_minutes=4.2,
+    )
+    dashboard = RuntimeDashboard(fake_portfolio(closed_positions=[trade]))
+    view = dashboard.project(
+        now=NOW, provider="DIRECT", provider_mode="REALTIME_FAST",
+        watcher_status="ACTIVE", quotes={},
+        scalp_result={"traces": [], "diagnostics": {"funnel": {}}},
+    )
+    output = dashboard.render(view)
+    assert "RECENT TRADES" in output
+    assert "POSITION PRGO" in output
+    assert "hold=4m12s" in output
+    assert "gross=$-0.12 cost=$0.08 net=$-0.20" in output
 
 
 def test_dashboard_suppresses_semantically_identical_poll(monkeypatch):

@@ -39,7 +39,7 @@ class PositionController:
                  executor: ShadowExecutor, *, status_path: Path, events_path: Path,
                  clock=None, interval=None, candidate_watcher=None,
                  event_orchestrator=None, scalp_runtime=None, debug=False,
-                 dashboard=None):
+                 dashboard=None, scalp_v2_runtime=None):
         if config.MODE != "SHADOW_TRADING":
             raise ValueError("watcher is local SHADOW_TRADING only")
         self.portfolio, self.provider, self.executor = portfolio, provider, executor
@@ -50,6 +50,7 @@ class PositionController:
         self.candidate_watcher = candidate_watcher
         self.event_orchestrator = event_orchestrator
         self.scalp_runtime = scalp_runtime
+        self.scalp_v2_runtime = scalp_v2_runtime
         self.debug = bool(debug)
         self.dashboard = dashboard
         if (candidate_watcher is not None and event_orchestrator is not None
@@ -73,6 +74,9 @@ class PositionController:
         # cannot leak synthetic quotes into the real session log.
         self.quote_provenance_path = self.events_path.with_name(
             Path(config.QUOTE_PROVENANCE_LOG_PATH).name
+        )
+        self.cycle_timing_path = self.events_path.with_name(
+            'fast_watcher_latency.jsonl'
         )
         self._age_total = self._age_count = self._duration_total = self._cycles = 0
         self.metrics = dict(quote_requests=0, quote_failures=0, average_quote_age=None,
@@ -222,11 +226,15 @@ class PositionController:
 
     def tick(self):
         started = monotonic()
+        cycle_wall_started = self.clock()
+        if cycle_wall_started.tzinfo is None:
+            cycle_wall_started = cycle_wall_started.replace(tzinfo=timezone.utc)
         quote_batch_started = started
         poll_cycle_id = 'QUOTE-POLL-' + uuid4().hex
         loop_delay = (max(0.0, started-self._last_tick_started-self.interval)
                       if self._last_tick_started is not None else 0.0)
         self._last_tick_started = started
+        discovery_started = monotonic()
         before = self.portfolio.snapshot()
         all_symbols = sorted({p.symbol for p in before.open_positions})
         candidate_symbols = (
@@ -234,13 +242,24 @@ class PositionController:
             if self.candidate_watcher is not None else []
         )
         scalp_symbols = self.scalp_runtime.symbols(self.clock()) if self.scalp_runtime is not None else []
-        requested_symbols = list(dict.fromkeys(all_symbols + candidate_symbols + scalp_symbols))
+        # V2 records a logical FAST_WATCH set, but the control's provider
+        # universe/order remains untouched. Activating a separate prioritized
+        # provider schedule requires a later controlled capacity experiment.
+        scalp_v2_symbols = (
+            self.scalp_v2_runtime.fast_watch_symbols()
+            if self.scalp_v2_runtime is not None else []
+        )
+        requested_symbols = list(dict.fromkeys(
+            all_symbols + candidate_symbols + scalp_symbols
+        ))
         symbols = requested_symbols[:config.FAST_WATCH_MAX_SYMBOLS]
+        discovery_duration = monotonic() - discovery_started
         self.status["open_symbols"] = all_symbols
         self.status["watched_symbols"] = symbols
         self.status["position_symbols"] = all_symbols
         self.status["candidate_symbols"] = candidate_symbols
         self.status["scalp_symbols"] = scalp_symbols
+        self.status["scalp_v2_fast_watch_symbols"] = scalp_v2_symbols
         self.status["unmonitored_symbols"] = requested_symbols[len(symbols):]
         quotes = {}
         failed = False
@@ -264,6 +283,7 @@ class PositionController:
         # Re-read the clock AFTER IO; never bless a quote that aged during a wait.
         now = self.clock()
         degraded = failed or self.provider.mode != "REALTIME_FAST" or len(symbols) < len(requested_symbols)
+        ingest_started = monotonic()
         fresh = {}
         scalp_observed = {}
         quote_quality = {}
@@ -360,6 +380,10 @@ class PositionController:
             else:
                 degraded = True
                 self._event("FAST_QUOTE_STALE", now, symbol=symbol)
+        quote_ingest_duration = monotonic() - ingest_started
+        quote_ingested_at = self.clock()
+        if quote_ingested_at.tzinfo is None:
+            quote_ingested_at = quote_ingested_at.replace(tzinfo=timezone.utc)
 
         # Establish/reset the local U.S. trading-day counters before a fast
         # candidate can be risk-checked and opened on the new session.
@@ -369,6 +393,7 @@ class PositionController:
         # Canonical open-position work always wins the cycle. POSITION exits
         # are committed here; SCALP exits run at the start of its runtime call.
         # Only after both paths have processed exits may discovery open risk.
+        position_started = monotonic()
         degraded, position_events, closed_events = self._manage_position_strategy(
             fresh, all_symbols, now, degraded
         )
@@ -381,10 +406,12 @@ class PositionController:
                 self.event_orchestrator.position_closed(
                     symbol, now=now, reason=reason
                 )
+        position_work_duration = monotonic() - position_started
 
         # Existing scalp positions own the cycle before any momentum candidate
         # work. This keeps mandatory exits ahead of pre-execution refresh IO.
         scalp_result = None
+        scalp_started = monotonic()
         if self.scalp_runtime is not None:
             scalp_kwargs = {
                 'now': now,
@@ -403,6 +430,15 @@ class PositionController:
                     'configured_interval_seconds': self.interval,
                     'poll_cycle_id': poll_cycle_id,
                     'quote_batch_duration_seconds': quote_batch_duration,
+                    'symbol_discovery_duration_seconds': discovery_duration,
+                    'quote_ingest_duration_seconds': quote_ingest_duration,
+                    'quote_ingested_at': quote_ingested_at.astimezone(
+                        timezone.utc
+                    ).isoformat(),
+                    'position_work_duration_seconds': position_work_duration,
+                    'cycle_started_at': cycle_wall_started.astimezone(
+                        timezone.utc
+                    ).isoformat(),
                     'symbols_requested': len(symbols),
                     'provider_concurrency': 1,
                 }
@@ -422,7 +458,25 @@ class PositionController:
                     if detail.get('status') == 'OPENED':
                         self.event_orchestrator.position_opened(
                             detail['symbol'], now=now, trade_id=detail['trade_id'])
+        scalp_work_duration = monotonic() - scalp_started
 
+        scalp_v2_result = None
+        scalp_v2_started = monotonic()
+        if self.scalp_v2_runtime is not None and scalp_result is not None:
+            scalp_v2_result = self.scalp_v2_runtime.on_v1_cycle(
+                scalp_result, now=now,
+            )
+            self.status["scalp_v2_research"] = {
+                key: scalp_v2_result.get(key) for key in (
+                    "strategy_id", "research_only", "armed", "armed_symbols",
+                    "fast_triggers", "entry_ready", "open_research_positions",
+                    "closed_research_trades", "research_realized_pnl",
+                    "research_unrealized_pnl", "duration_ms",
+                )
+            }
+        scalp_v2_work_duration = monotonic() - scalp_v2_started
+
+        candidate_started = monotonic()
         if self.candidate_watcher is not None:
             if self.event_orchestrator is not None:
                 for symbol in candidate_symbols:
@@ -437,7 +491,9 @@ class PositionController:
                 quote = fresh.get(symbol)
                 if quote is not None:
                     self.event_orchestrator.quote(quote, position=True)
+        candidate_work_duration = monotonic() - candidate_started
 
+        terminal_started = monotonic()
         if degraded and symbols:
             self.metrics["degraded_intervals"] += 1
             self._event("PRICE_MONITORING_DEGRADED", now, mode=self.provider.mode)
@@ -609,7 +665,9 @@ class PositionController:
                 provider_mode=self.provider.mode,
                 watcher_status=projected_status,
                 quotes=quotes, scalp_result=scalp_result,
+                scalp_v2_result=scalp_v2_result,
             )
+        terminal_render_duration = monotonic() - terminal_started
         if (fresh or scalp_result is not None) and sample_due:
             self._last_sample = monotonic()
             if fresh:
@@ -637,7 +695,72 @@ class PositionController:
         self.status.update(heartbeat=now.isoformat(), status=("IDLE" if not symbols else
                            "FAST_WATCHER_UNAVAILABLE" if failed else "DEGRADED" if degraded else "ACTIVE"),
                            provider_metrics=dict(getattr(self.provider, "metrics", {})))
+        status_started = monotonic()
         atomic_json(self.status_path, self.status)
+        status_persistence_duration = monotonic() - status_started
+        cycle_duration = monotonic() - started
+        current_positions = {
+            item.symbol: item for item in self.portfolio.snapshot().open_positions
+        }
+        position_monitoring = {}
+        for symbol in all_symbols:
+            quote = quotes.get(symbol)
+            checked = symbol in fresh and quote is not None
+            position = current_positions.get(symbol)
+            position_monitoring[symbol] = {
+                'latest_mark_exchange_timestamp': (
+                    quote.timestamp.astimezone(timezone.utc).isoformat()
+                    if quote is not None and quote.timestamp.tzinfo else None
+                ),
+                'latest_mark_age_seconds': (
+                    quote.age_at(now) if quote is not None else None
+                ),
+                'stop_check_at': now.astimezone(timezone.utc).isoformat()
+                if checked else None,
+                'target_check_at': now.astimezone(timezone.utc).isoformat()
+                if checked else None,
+                'provider_latency_ms': (
+                    quote.provider_latency_seconds * 1000
+                    if quote is not None
+                    and quote.provider_latency_seconds is not None else None
+                ),
+                'fallback_used': bool(
+                    quote is not None and quote.mid_price is None
+                    and price(quote.last_price) is not None
+                ),
+                'monitoring_status': (
+                    position.monitoring_status if position is not None else 'CLOSED'
+                ),
+                'provider_mode': self.provider.mode,
+            }
+        cycle_timing = {
+            'poll_cycle_id': poll_cycle_id,
+            'cycle_started_at': cycle_wall_started.astimezone(timezone.utc).isoformat(),
+            'cycle_finished_at': self.clock().astimezone(timezone.utc).isoformat(),
+            'configured_interval_seconds': self.interval,
+            'cycle_duration_seconds': cycle_duration,
+            'cycle_to_cycle_delay_seconds': loop_delay,
+            'estimated_wait_seconds': max(0.0, self.interval-cycle_duration),
+            'symbol_discovery_duration_seconds': discovery_duration,
+            'quote_batch_duration_seconds': quote_batch_duration,
+            'quote_ingest_duration_seconds': quote_ingest_duration,
+            'position_work_duration_seconds': position_work_duration,
+            'scalp_work_duration_seconds': scalp_work_duration,
+            'scalp_v2_research_duration_seconds': scalp_v2_work_duration,
+            'candidate_work_duration_seconds': candidate_work_duration,
+            'terminal_render_duration_seconds': terminal_render_duration,
+            'status_persistence_duration_seconds': status_persistence_duration,
+            'symbols_requested': len(symbols),
+            'provider_concurrency': 1,
+            'dashboard_enabled': self.dashboard is not None,
+            'debug_output_enabled': self.debug,
+            'position_monitoring': position_monitoring,
+        }
+        self.status['latest_cycle_timing'] = cycle_timing
+        event(
+            self.cycle_timing_path, 'FAST_CYCLE_TIMING', self.clock(),
+            max_bytes=config.FAST_EVENT_LOG_MAX_BYTES, **cycle_timing,
+        )
         return dict(self.status)
 
 

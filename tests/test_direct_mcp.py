@@ -380,6 +380,51 @@ def test_connection_tool_discovery_clean_shutdown_and_order_rejection():
     assert context.closed
 
 
+def test_historical_batch_reserves_capacity_for_fast_quotes():
+    class ConcurrencyContext(AbstractAsyncContextManager):
+        def __init__(self):
+            self.active = 0
+            self.maximum = 0
+
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return None
+
+        async def list_tools(self, **kwargs):
+            schema = {
+                "type": "object",
+                "properties": {"symbol": {"type": "string"}},
+                "required": ["symbol"],
+            }
+            return SimpleNamespace(tools=[SimpleNamespace(
+                name="get_equity_historicals", description="",
+                input_schema=schema,
+            )])
+
+        async def call_tool(self, name, arguments):
+            self.active += 1
+            self.maximum = max(self.maximum, self.active)
+            await asyncio.sleep(.01)
+            self.active -= 1
+            return SimpleNamespace(
+                is_error=False, structured_content={"results": []},
+            )
+
+    context = ConcurrencyContext()
+    client = DirectRobinhoodMcpClient(
+        storage=Stored(), sdk_factory=lambda provider: context,
+    )
+    client.start()
+    try:
+        calls = client.get_historicals_many(
+            ["AAPL", "AMD", "AMZN", "GOOGL", "META", "MSFT"]
+        )
+    finally:
+        client.close()
+    assert len(calls) == 6
+    assert context.maximum == config.ROBINHOOD_MCP_HISTORICAL_BATCH_CONCURRENCY
+    assert context.maximum < config.ROBINHOOD_MCP_MAX_CONCURRENCY
+
+
 def test_missing_credentials_does_not_start_connection():
     class Empty:
         def has_credentials(self): return False

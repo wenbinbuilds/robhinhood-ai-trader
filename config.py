@@ -14,6 +14,10 @@ ROBINHOOD_MCP_OAUTH_CALLBACK_PORT = 8765
 ROBINHOOD_MCP_CONNECT_TIMEOUT_SECONDS = 30
 ROBINHOOD_MCP_REQUEST_TIMEOUT_SECONDS = 30
 ROBINHOOD_MCP_MAX_CONCURRENCY = 4
+# Historical batches are lower priority than the two-second quote path. Keep
+# only two history calls in flight so a batch cannot occupy every MCP slot and
+# queue fresh quote requests behind the entire universe.
+ROBINHOOD_MCP_HISTORICAL_BATCH_CONCURRENCY = 2
 ROBINHOOD_MCP_READ_RETRIES = 2
 ROBINHOOD_MCP_RETRY_BASE_SECONDS = 0.25
 ROBINHOOD_DIRECT_TIMINGS_PATH = "state/direct_mcp_timings.json"
@@ -289,6 +293,17 @@ SCALP_MAX_TRADES_PER_SYMBOL = 3
 SCALP_MAX_TRADES_PER_SESSION = 8
 SCALP_MAX_CONSECUTIVE_LOSSES = 2
 SCALP_MAX_DAILY_LOSS_PERCENT = 0.005
+
+# Parallel research control. HYBRID_SCALP never owns the canonical portfolio,
+# never calls a provider, and cannot route an order. It consumes the causal V1
+# observation stream and keeps isolated research state/P&L for comparison.
+SCALP_V2_RESEARCH_ENABLED = True
+SCALP_V2_STRATEGY_ID = "HYBRID_SCALP_V2_RESEARCH"
+SCALP_V2_STATE_PATH = "state/scalp_v2_research.json"
+SCALP_V2_EVENT_LOG_PATH = "logs/scalp_v2_research.jsonl"
+SCALP_V2_QUOTE_BUFFER_SECONDS = 240
+SCALP_V2_RESEARCH_MAX_HOLD_SECONDS = 180
+SCALP_V2_TRIGGER_MAX_EXTENSION_PCT = 0.003
 SCALP_MAX_TRANSACTION_COST_PERCENT = 0.002
 SCALP_CAPITAL_ALLOCATION_PERCENT = 0.20
 SCALP_MAX_POSITION_PERCENT = 0.02

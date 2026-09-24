@@ -1,0 +1,77 @@
+{
+  "sample_start": "2026-09-24T19:25:38.224499+00:00",
+  "sample_end": "2026-09-24T19:26:40.787160+00:00",
+  "complete_cycles": 32,
+  "scalp_quote_observations": 392,
+  "scalp_entries_created": 0,
+  "cycle_start_cadence_seconds": {
+    "count": 31,
+    "median": 2.005115,
+    "p90": 2.005158,
+    "p95": 2.005206,
+    "max": 2.005592
+  },
+  "cycle_duration_seconds": {
+    "count": 32,
+    "median": 0.37803316698409617,
+    "p90": 0.7988014827307782,
+    "p95": 0.9616656773141585,
+    "max": 1.0690183329861611
+  },
+  "estimated_wait_seconds": {
+    "count": 32,
+    "median": 1.6219668330159038,
+    "p90": 1.674858325259993,
+    "p95": 1.6782079660013551,
+    "max": 1.6840555830276571
+  },
+  "provider_latency_ms": {
+    "count": 392,
+    "median": 226.50608303956687,
+    "p90": 723.1696670060046,
+    "p95": 789.2699021584122,
+    "max": 838.0180000094697
+  },
+  "quote_age_at_receive_seconds": {
+    "count": 392,
+    "median": 1.6248765,
+    "p90": 7.409601800000004,
+    "p95": 11.541645099999997,
+    "max": 23.412467
+  },
+  "local_receive_to_evaluation_ms": {
+    "count": 392,
+    "median": 1.355,
+    "p90": 1.62,
+    "p95": 2.3357,
+    "max": 4779.687
+  },
+  "quote_age_buckets_percent": {
+    "le_500ms": 5.612244897959184,
+    "le_1s": 21.683673469387756,
+    "le_2s": 61.734693877551024,
+    "le_3s": 76.53061224489795,
+    "gt_3s": 23.46938775510204
+  },
+  "phase_duration_seconds": {
+    "quote_batch": {"median": 0.22614268699544482, "p95": 0.7911226621974492, "max": 0.7943882499821484},
+    "quote_ingest": {"median": 0.0035137289960402995, "p95": 0.006617541846935636, "max": 0.0074972500442527235},
+    "position_work": {"median": 0.05985349998809397, "p95": 0.07508542501891496, "max": 0.08681925002019852},
+    "scalp_work": {"median": 0.03584681250504218, "p95": 0.13627861250424755, "max": 0.2190445419983007},
+    "candidate_work": {"median": 0.053377042000647634, "p95": 0.0622982981178211, "max": 0.08737349999137223},
+    "terminal_render": {"median": 0.0007567084976471961, "p95": 0.0008679524704348296, "max": 0.0008930420153774321},
+    "status_persistence": {"median": 0.0010243750002700835, "p95": 0.0018209688831120723, "max": 0.010027249983977526}
+  },
+  "nbis_monitoring": {
+    "mark_age_seconds": {"count": 32, "median": 1.6124875, "p95": 3.5994915, "max": 4.175103},
+    "provider_latency_ms": {"count": 32, "median": 223.08029150008224, "p95": 752.8305921674473, "max": 789.4985409802757},
+    "fallback_count": 0,
+    "provider_mode": "DIRECT_MCP_UNVALIDATED",
+    "monitoring_status": "PRICE_MONITORING_DEGRADED"
+  },
+  "limitations": [
+    "The sample is approximately one minute and too short for durable production percentiles.",
+    "The discovered-symbol mix differs from the pre-fix session.",
+    "No entry passed all gates, so no connected shadow-execution latency was observed."
+  ]
+}
